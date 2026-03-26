@@ -3,14 +3,25 @@
 #include <freertos/task.h>
 #include <freertos/semphr.h>
 
-constexpr uint8_t LoRA_RX = 18;
-constexpr uint8_t LoRA_TX = 19;
-constexpr uint8_t AUX = 23;
+constexpr uint8_t LoRA_RX = 27;
+constexpr uint8_t LoRA_TX = 26;
+// constexpr uint8_t AUX = 14;
 constexpr uint8_t HEADER1 = 0xAA;
 constexpr uint8_t HEADER2 = 0x55;
 constexpr uint8_t PAYLOAD_SIZE = 25;
 
+constexpr uint8_t CMD_PREFIX_0 = 0x00;
+constexpr uint8_t CMD_ERASE_PREFIX = 0x03;
+
 SemaphoreHandle_t TlmMutex;
+
+// コマンド用のステートマシン状態定義
+enum EraseState
+{
+  STATE_IDLE,        // 通常のコマンド待ち
+  STATE_WAIT_CONFIRM // 'x'が押され、'y'か'n'の確認待ち
+};
+EraseState current_loop_state = STATE_IDLE;
 
 struct TelemetryData
 {
@@ -23,7 +34,7 @@ struct TelemetryData
   uint8_t rssi;
 } TlmData;
 
-TelemetryData TLM;
+TelemetryData TLM = {7, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
 TelemetryData print_TLM;
 
 void decode_task(void *pvParameters);
@@ -44,13 +55,54 @@ void loop()
   if (Serial.available())
   {
     char cmd = Serial.read();
-    Serial1.write(0x00);
-    Serial1.write(0x00);
-    Serial1.write(0x03);
-    Serial1.write(cmd);
-    Serial.println(cmd);
+
+    switch (current_loop_state)
+    {
+    case STATE_IDLE:
+      if (cmd == 'x')
+      {
+        Serial.println("Do you want to erase flash? (y/n)");
+        // 次のループからは確認待ち状態になる
+        current_loop_state = STATE_WAIT_CONFIRM;
+      }
+      else
+      {
+        // 'x' 以外の通常のコマンド送信
+        Serial1.write(CMD_PREFIX_0);     // add_u
+        Serial1.write(CMD_PREFIX_0);     // add_l
+        Serial1.write(CMD_ERASE_PREFIX); // channel
+        Serial1.write(cmd);
+        Serial.println(cmd);
+      }
+      break;
+
+    case STATE_WAIT_CONFIRM:
+      if (cmd == 'y')
+      {
+        Serial.println("erase start");
+        Serial1.write(CMD_PREFIX_0);
+        Serial1.write(CMD_PREFIX_0);
+        Serial1.write(CMD_ERASE_PREFIX);
+        Serial1.write('x'); // 消去コマンド本体
+        Serial.println("x");
+        current_loop_state = STATE_IDLE; // 処理が終わったら通常状態に戻る
+      }
+      else if (cmd == 'n')
+      {
+        Serial.println("erase denied");
+        current_loop_state = STATE_IDLE; // キャンセルして通常状態に戻る
+      }
+      else
+      {
+        // 'y' でも 'n' でもない無効な入力の場合
+        Serial.println("try again\n press x  to erase flash");
+        current_loop_state = STATE_IDLE; // 一旦リセットする
+      }
+      break;
+    }
   }
-  delay(300);
+
+  delay(50);
 }
 
 void decode_task(void *pvParameters)
@@ -130,7 +182,7 @@ void decode_task(void *pvParameters)
         break;
       }
     }
-    delay(300);
+    delay(50);
   }
 }
 
@@ -148,10 +200,10 @@ TelemetryData buffer_to_telemetry(uint8_t buffer[PAYLOAD_SIZE])
   uint8_t status = buffer[idx];
   idx += 1;
 
-  memcpy(&lat_i32, &buffer[idx], sizeof(uint32_t));
+  memcpy(&lat_i32, &buffer[idx], sizeof(int32_t));
   idx += 4;
 
-  memcpy(&lon_i32, &buffer[idx], sizeof(uint32_t));
+  memcpy(&lon_i32, &buffer[idx], sizeof(int32_t));
   idx += 4;
 
   memcpy(angle_speed, &buffer[idx], sizeof(int16_t) * 3);
@@ -169,9 +221,9 @@ TelemetryData buffer_to_telemetry(uint8_t buffer[PAYLOAD_SIZE])
   tlm.status = status;
   tlm.latitude = lat_i32;
   tlm.longitude = lon_i32;
-  memcpy(&tlm.angle_speed, &angle_speed, sizeof(angle_speed));
-  memcpy(&tlm.acceleration, &acceleration, sizeof(acceleration));
-  memcpy(&tlm.air_pressure, &air_pressure_24, sizeof(air_pressure_24));
+  memcpy(tlm.angle_speed, angle_speed, sizeof(angle_speed));
+  memcpy(tlm.acceleration, acceleration, sizeof(acceleration));
+  memcpy(tlm.air_pressure, air_pressure_24, sizeof(air_pressure_24));
   tlm.rssi = rssi;
   return tlm;
 }
@@ -194,21 +246,21 @@ void print_telemetry_task(void *pvParameters)
     uint8_t parachute_st = (status >> 7) & 1;    // 1なら開傘
 
     // ステータスの出力
-    Serial.printf("Status: CamLog:%s CamPwr:%s PiPwr:%s ParaLog:%s CanCam:%s Sequence:%s Liftoff:%s Para:%s\r\n",
+    Serial.printf("Status\r\nCamLog:%s CamPwr:%s PiPwr:%s CanPara:%s CanCam:%s Sequence:%s Liftoff:%s Para:%s\r\n",
                   camera_log_st == 0 ? "ON" : "OFF",
                   camera_power_st == 0 ? "ON" : "OFF",
                   raspi_power_st == 0 ? "ON" : "OFF",
-                  can_para_log_st == 1 ? "OK" : "\e[31mCAN_P_ERR\e[m",
-                  can_camera_st == 1 ? "OK" : "\e[31mCAN_C_ERR\e[m",
-                  sequence_st == 1 ? "\e[32mSTART\e[m" : "WAIT",
-                  liftoff_st == 1 ? "\e[31mDETECT\e[m" : "WAIT",
-                  parachute_st == 1 ? "\e[31mOPEN\e[m" : "CLOSE");
+                  can_para_log_st == 1 ? "OK" : "\033[31mCAN_P_ERR\033[m",
+                  can_camera_st == 1 ? "OK" : "\033[31mCAN_C_ERR\033[m",
+                  sequence_st == 1 ? "\033[32mSTART\033[m" : "WAIT",
+                  liftoff_st == 1 ? "\033[31mDETECT\033[m" : "WAIT",
+                  parachute_st == 1 ? "\033[31mOPEN\033[m" : "CLOSE");
 
     // 緯度・経度の出力
-    Serial.printf("Lat: %ld, Lon: %ld\r\n", print_TLM.latitude, print_TLM.longitude);
+    Serial.printf("Latitude: %ld, Longitude: %ld\r\n", print_TLM.latitude, print_TLM.longitude);
 
     //  角速度の出力
-    Serial.printf("Angle Speed  [X: %d, Y: %d, Z: %d]\r\n",
+    Serial.printf("Angular Velocity  [X: %d, Y: %d, Z: %d]\r\n",
                   print_TLM.angle_speed[0], print_TLM.angle_speed[1], print_TLM.angle_speed[2]);
 
     //  加速度の出力
@@ -223,7 +275,8 @@ void print_telemetry_task(void *pvParameters)
 
     //  RSSIの出力 (dBm)
     Serial.printf("RSSI: %d dBm\r\n", (int)print_TLM.rssi - 256);
+    Serial.println();
 
-    delay(300);
+    delay(1500);
   }
 }
