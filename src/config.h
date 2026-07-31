@@ -10,6 +10,11 @@ enum class BootMode
 
 constexpr BootMode BOOT_MODE = BootMode::Communication;
 
+constexpr uint8_t top_led = 19;
+constexpr uint8_t liftoff_led = 21;
+constexpr uint8_t control_led = 13;
+constexpr uint8_t update_led = 14;
+
 constexpr uint8_t aux = 27;
 constexpr uint8_t LoRA_RX = 26;
 constexpr uint8_t LoRA_TX = 25;
@@ -47,20 +52,14 @@ struct TelemetryData
   uint8_t header1;
 
   uint8_t status;
-
   int32_t latitude;
   int32_t longitude;
-
-  // 10 m単位
-  int16_t gnss_height;
-
+  int16_t gnss_height; // 10 m単位
   int16_t angle_speed[3];
   int16_t acceleration[3];
   int16_t integrated_angle[3];
-
   uint8_t air_pressure[3];
   uint8_t air_speed;
   int8_t fin_angle;
-
   uint8_t rssi;
 };
