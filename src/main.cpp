@@ -2,52 +2,141 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <freertos/semphr.h>
+#include <string.h>
 
-constexpr uint8_t LoRA_RX = 27;
-constexpr uint8_t LoRA_TX = 26;
-// constexpr uint8_t AUX = 14;
+// LoRA pin Definitions
+constexpr uint8_t aux = 27;
+constexpr uint8_t LoRA_RX = 26;
+constexpr uint8_t LoRA_TX = 25;
+constexpr uint8_t m0 = 32;
+constexpr uint8_t m1 = 33;
+constexpr uint8_t settingCmd[] = {
+    0xC0, 0x00, 0x08,
+    0x00, 0x00,
+    0xEC,        // UART 115200bps + SF8/BW125
+    0x81,        // 64byte sub-packet + 13dBm
+    0x04,        // BW125時 CH4 = 921.4MHz
+    0xC3,        // 元設定を維持
+    0x00, 0x00}; // 本部側
+constexpr uint8_t readCmd[3] = {0xC1, 0x00, 0x0a};
+
+// E220 fixed transmission prefix
+constexpr uint8_t ADD_H = 0x00;
+constexpr uint8_t ADD_L = 0x00;
+constexpr uint8_t CHNNL = 0x04;
+
+// Payload header
 constexpr uint8_t HEADER1 = 0xAA;
-constexpr uint8_t HEADER2 = 0x55;
-constexpr uint8_t PAYLOAD_SIZE = 25;
 
+// E220でRSSI付加を有効にしているなら true
+// RSSI付加していないなら false にする
+constexpr bool LORA_APPEND_RSSI = true;
+
+// 送信側UARTへ渡す全体サイズ
+// offset 0..38 = 39 bytes
+constexpr uint8_t TX_FRAME_SIZE = 39;
+
+// 受信側UARTに出てくるフレームサイズ
+constexpr uint8_t RX_FRAME_SIZE = TX_FRAME_SIZE - 3;
+
+// checksum対象範囲
+// offset 3..37 = HEADER1 から fin_angle まで
+constexpr uint8_t CHECKSUM_START_OFFSET = 3;
+constexpr uint8_t CHECKSUM_END_OFFSET = 37;
+constexpr uint8_t CHECKSUM_OFFSET = 38;
+
+// Command
 constexpr uint8_t CMD_PREFIX_0 = 0x00;
-constexpr uint8_t CMD_ERASE_PREFIX = 0x03;
+constexpr uint8_t CMD_CHNNL = 0x04;
 
 SemaphoreHandle_t TlmMutex;
+TaskHandle_t printTaskHandle = NULL;
 
-// コマンド用のステートマシン状態定義
 enum EraseState
 {
-  STATE_IDLE,        // 通常のコマンド待ち
-  STATE_WAIT_CONFIRM // 'x'が押され、'y'か'n'の確認待ち
+  STATE_IDLE,
+  STATE_WAIT_CONFIRM
 };
+
 EraseState current_loop_state = STATE_IDLE;
 
 struct TelemetryData
 {
+  uint8_t add_h;
+  uint8_t add_l;
+  uint8_t chnnl;
+  uint8_t header1;
+
   uint8_t status;
+
   int32_t latitude;
   int32_t longitude;
+
+  // 10 m単位
+  int16_t gnss_height;
+
   int16_t angle_speed[3];
   int16_t acceleration[3];
-  uint8_t air_pressure[3];
-  uint8_t rssi;
-} TlmData;
+  int16_t integrated_angle[3];
 
-TelemetryData TLM = {7, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+  uint8_t air_pressure[3];
+  uint8_t air_speed;
+  int8_t fin_angle;
+
+  uint8_t rssi;
+};
+
+TelemetryData TLM = {
+    ADD_H,
+    ADD_L,
+    CHNNL,
+    HEADER1,
+    0,
+    0,
+    0,
+    0,
+    {0, 0, 0},
+    {0, 0, 0},
+    {0, 0, 0},
+    {0, 0, 0},
+    0,
+    0,
+    0};
+
 TelemetryData print_TLM;
 
 void decode_task(void *pvParameters);
-TelemetryData buffer_to_telemetry(uint8_t buffer[PAYLOAD_SIZE]);
 void print_telemetry_task(void *pvParameters);
+
+uint8_t calc_checksum_from_full_frame(const uint8_t *full_frame);
+bool verify_checksum(const uint8_t *full_frame);
+void publish_telemetry(const uint8_t *full_frame, uint8_t rssi);
+TelemetryData buffer_to_telemetry(const uint8_t *full_frame, uint8_t rssi);
 
 void setup()
 {
   Serial.begin(115200);
-  Serial1.begin(9600, SERIAL_8N1, LoRA_RX, LoRA_TX);
+  Serial1.begin(115200, SERIAL_8N1, LoRA_RX, LoRA_TX);
+
   TlmMutex = xSemaphoreCreateMutex();
-  xTaskCreateUniversal(decode_task, "decode_task", 4096, NULL, 3, NULL, 0);
-  xTaskCreateUniversal(print_telemetry_task, "print_telemetry_task", 4096, NULL, 1, NULL, 0);
+
+  xTaskCreateUniversal(
+      decode_task,
+      "decode_task",
+      4096,
+      NULL,
+      3,
+      NULL,
+      0);
+
+  xTaskCreateUniversal(
+      print_telemetry_task,
+      "print_telemetry_task",
+      4096,
+      NULL,
+      1,
+      &printTaskHandle,
+      0);
 }
 
 void loop()
@@ -56,22 +145,32 @@ void loop()
   {
     char cmd = Serial.read();
 
+    // シリアルモニタの改行を無視
+    if (cmd == '\r' || cmd == '\n')
+    {
+      delay(50);
+      return;
+    }
+
     switch (current_loop_state)
     {
     case STATE_IDLE:
       if (cmd == 'x')
       {
         Serial.println("Do you want to erase flash? (y/n)");
-        // 次のループからは確認待ち状態になる
         current_loop_state = STATE_WAIT_CONFIRM;
       }
       else
       {
-        // 'x' 以外の通常のコマンド送信
-        Serial1.write(CMD_PREFIX_0);     // add_u
-        Serial1.write(CMD_PREFIX_0);     // add_l
-        Serial1.write(CMD_ERASE_PREFIX); // channel
-        Serial1.write(cmd);
+        // E220固定送信用コマンド
+        // 例: g -> 00 00 04 67
+        // 例: h -> 00 00 04 68
+        Serial1.write(CMD_PREFIX_0);
+        Serial1.write(CMD_PREFIX_0);
+        Serial1.write(CMD_CHNNL);
+        Serial1.write((uint8_t)cmd);
+
+        Serial.print("send cmd: ");
         Serial.println(cmd);
       }
       break;
@@ -80,23 +179,24 @@ void loop()
       if (cmd == 'y')
       {
         Serial.println("erase start");
+
         Serial1.write(CMD_PREFIX_0);
         Serial1.write(CMD_PREFIX_0);
-        Serial1.write(CMD_ERASE_PREFIX);
-        Serial1.write('x'); // 消去コマンド本体
-        Serial.println("x");
-        current_loop_state = STATE_IDLE; // 処理が終わったら通常状態に戻る
+        Serial1.write(CMD_CHNNL);
+        Serial1.write((uint8_t)'x');
+
+        Serial.println("send cmd: x");
+        current_loop_state = STATE_IDLE;
       }
       else if (cmd == 'n')
       {
         Serial.println("erase denied");
-        current_loop_state = STATE_IDLE; // キャンセルして通常状態に戻る
+        current_loop_state = STATE_IDLE;
       }
       else
       {
-        // 'y' でも 'n' でもない無効な入力の場合
-        Serial.println("try again\n press x  to erase flash");
-        current_loop_state = STATE_IDLE; // 一旦リセットする
+        Serial.println("try again\npress x to erase flash");
+        current_loop_state = STATE_IDLE;
       }
       break;
     }
@@ -105,126 +205,146 @@ void loop()
   delay(50);
 }
 
-void decode_task(void *pvParameters)
+uint8_t calc_checksum_from_full_frame(const uint8_t *full_frame)
 {
   uint8_t checksum = 0;
+
+  for (uint8_t i = CHECKSUM_START_OFFSET; i <= CHECKSUM_END_OFFSET; i++)
+  {
+    checksum ^= full_frame[i];
+  }
+
+  return checksum;
+}
+
+bool verify_checksum(const uint8_t *full_frame)
+{
+  uint8_t calculated = calc_checksum_from_full_frame(full_frame);
+  uint8_t received = full_frame[CHECKSUM_OFFSET];
+
+  return calculated == received;
+}
+
+void decode_task(void *pvParameters)
+{
   uint8_t state = 0;
-  uint8_t buffer[PAYLOAD_SIZE];
-  int bufferIndex = 0;
+  uint8_t rx_index = 0;
+
+  // offset 0..38 の完全なフレームに復元して扱う
+  uint8_t full_frame[TX_FRAME_SIZE];
+
   while (1)
   {
     while (Serial1.available() > 0)
     {
       uint8_t c = Serial1.read();
 
+      // E220固定送信で、受信UARTに 00 00 04 が出てこない場合
+      // 受信UARTには AA ... checksum が出てくる想定
+
       switch (state)
       {
-      case 0: // ヘッダー1待ち
+      case 0:
         if (c == HEADER1)
+        {
+          full_frame[0] = ADD_H;
+          full_frame[1] = ADD_L;
+          full_frame[2] = CHNNL;
+          full_frame[3] = c;
+
+          rx_index = 4;
           state = 1;
-        break;
-
-      case 1: // ヘッダー2待ち
-        if (c == HEADER2)
-        {
-          state = 2; // ヘッダーが揃ったら次へ
-          bufferIndex = 0;
-          checksum = HEADER1 ^ HEADER2; // チェックサム初期化
-        }
-        else
-        {
-          Serial.println("invalid header");
-          state = 0; // ノイズだった場合は最初からやり直し
         }
         break;
 
-      case 2: // ペイロードの受信
-        buffer[bufferIndex++] = c;
-        checksum ^= c;
+      case 1:
+        full_frame[rx_index++] = c;
 
-        if (bufferIndex >= PAYLOAD_SIZE - 1)
+        if (rx_index >= TX_FRAME_SIZE)
         {
-          // Serial.println("to checksum");
-          state = 3; // データが規定サイズに達したらチェックサム確認へ
+          if (verify_checksum(full_frame))
+          {
+            if (LORA_APPEND_RSSI)
+            {
+              state = 2;
+            }
+            else
+            {
+              publish_telemetry(full_frame, 0);
+              state = 0;
+              rx_index = 0;
+            }
+          }
+          else
+          {
+            state = 0;
+            rx_index = 0;
+          }
         }
         break;
 
-      case 3: // チェックサムの確認
-        if (c == checksum)
-        {
-          state = 4;
-        }
-        else
-        {
-          // Serial.println("Checksum Error");
-          // for (int i = 0; i < PAYLOAD_SIZE; i++)
-          // {
-          //   Serial.print(buffer[i]);
-          // }
-          state = 0; // データが破損しているので破棄
-        }
-        break;
+      case 2:
+      {
+        uint8_t rssi = c;
+        publish_telemetry(full_frame, rssi);
 
-      case 4: // RSSIの受信
-        // dBm換算は(int)値 - 256
-        buffer[bufferIndex++] = c;
-        int rssi_dBm = (int)c - 256;
-        TelemetryData tlm = buffer_to_telemetry(buffer);
-        xSemaphoreTake(TlmMutex, portMAX_DELAY);
-        TLM = tlm;
-        xSemaphoreGive(TlmMutex);
-        // Serial.println(latitude);
-        // Serial.println(longitude);
-        // データを表示
-        // Serial.printf("RSSI: %d dBm", rssi_dBm);
-        state = 0; // 次のパケット待ちに戻る
-        bufferIndex = 0;
+        state = 0;
+        rx_index = 0;
+        break;
+      }
+
+      default:
+        state = 0;
+        rx_index = 0;
         break;
       }
     }
-    delay(50);
+
+    delay(15);
   }
 }
 
-TelemetryData buffer_to_telemetry(uint8_t buffer[PAYLOAD_SIZE])
+void publish_telemetry(const uint8_t *full_frame, uint8_t rssi)
 {
-  int idx = 0; // バッファの読み取り位置
-  int32_t lat_i32;
-  int32_t lon_i32;
-  int16_t angle_speed[3];
-  int16_t acceleration[3];
-  uint8_t air_pressure_24[3];
-  uint8_t rssi;
+  TelemetryData tlm = buffer_to_telemetry(full_frame, rssi);
+
+  xSemaphoreTake(TlmMutex, portMAX_DELAY);
+  TLM = tlm;
+  xSemaphoreGive(TlmMutex);
+
+  if (printTaskHandle != NULL)
+  {
+    xTaskNotifyGive(printTaskHandle);
+  }
+}
+
+TelemetryData buffer_to_telemetry(const uint8_t *buffer, uint8_t rssi)
+{
   TelemetryData tlm;
 
-  uint8_t status = buffer[idx];
-  idx += 1;
+  tlm.add_h = buffer[0];
+  tlm.add_l = buffer[1];
+  tlm.chnnl = buffer[2];
+  tlm.header1 = buffer[3];
 
-  memcpy(&lat_i32, &buffer[idx], sizeof(int32_t));
-  idx += 4;
+  tlm.status = buffer[4];
 
-  memcpy(&lon_i32, &buffer[idx], sizeof(int32_t));
-  idx += 4;
+  memcpy(&tlm.latitude, &buffer[5], sizeof(int32_t));
+  memcpy(&tlm.longitude, &buffer[9], sizeof(int32_t));
+  memcpy(&tlm.gnss_height, &buffer[13], sizeof(int16_t));
 
-  memcpy(angle_speed, &buffer[idx], sizeof(int16_t) * 3);
-  idx += 6;
+  memcpy(tlm.angle_speed, &buffer[15], sizeof(int16_t) * 3);
+  memcpy(tlm.acceleration, &buffer[21], sizeof(int16_t) * 3);
+  memcpy(tlm.integrated_angle, &buffer[27], sizeof(int16_t) * 3);
 
-  memcpy(acceleration, &buffer[idx], sizeof(int16_t) * 3);
-  idx += 6;
+  memcpy(tlm.air_pressure, &buffer[33], sizeof(uint8_t) * 3);
 
-  memcpy(air_pressure_24, &buffer[idx], sizeof(uint8_t) * 3);
-  idx += 3;
+  tlm.air_speed = buffer[36];
 
-  rssi = buffer[idx];
-  idx += 1;
+  memcpy(&tlm.fin_angle, &buffer[37], sizeof(int8_t));
 
-  tlm.status = status;
-  tlm.latitude = lat_i32;
-  tlm.longitude = lon_i32;
-  memcpy(tlm.angle_speed, angle_speed, sizeof(angle_speed));
-  memcpy(tlm.acceleration, acceleration, sizeof(acceleration));
-  memcpy(tlm.air_pressure, air_pressure_24, sizeof(air_pressure_24));
   tlm.rssi = rssi;
+
   return tlm;
 }
 
@@ -232,51 +352,41 @@ void print_telemetry_task(void *pvParameters)
 {
   while (1)
   {
+    ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+
     xSemaphoreTake(TlmMutex, portMAX_DELAY);
     print_TLM = TLM;
     xSemaphoreGive(TlmMutex);
+
     uint8_t status = print_TLM.status;
-    uint8_t camera_log_st = status & 1;          // 0でon 1でoff
-    uint8_t camera_power_st = (status >> 1) & 1; // 0でon 1でoff
-    uint8_t raspi_power_st = (status >> 2) & 1;  // 0でon 1でoff
-    uint8_t can_para_log_st = (status >> 3) & 1; // 1なら正常 0なら異常
-    uint8_t can_camera_st = (status >> 4) & 1;   // 1なら正常 0なら異常
-    uint8_t sequence_st = (status >> 5) & 1;     // 1ならスタート 0なら待機
-    uint8_t liftoff_st = (status >> 6) & 1;      // 1なら離床
-    uint8_t parachute_st = (status >> 7) & 1;    // 1なら開傘
 
-    // ステータスの出力
-    Serial.printf("Status\r\nCamLog:%s CamPwr:%s PiPwr:%s CanPara:%s CanCam:%s Sequence:%s Liftoff:%s Para:%s\r\n",
-                  camera_log_st == 0 ? "ON" : "OFF",
-                  camera_power_st == 0 ? "ON" : "OFF",
-                  raspi_power_st == 0 ? "ON" : "OFF",
-                  can_para_log_st == 1 ? "OK" : "\033[31mCAN_P_ERR\033[m",
-                  can_camera_st == 1 ? "OK" : "\033[31mCAN_C_ERR\033[m",
-                  sequence_st == 1 ? "\033[32mSTART\033[m" : "WAIT",
-                  liftoff_st == 1 ? "\033[31mDETECT\033[m" : "WAIT",
-                  parachute_st == 1 ? "\033[31mOPEN\033[m" : "CLOSE");
+    uint8_t camera_log_st = status & 1;
+    uint8_t camera_power_st = (status >> 1) & 1;
+    uint8_t raspi_power_st = (status >> 2) & 1;
+    uint8_t can_para_log_st = (status >> 3) & 1;
+    uint8_t can_camera_st = (status >> 4) & 1;
+    uint8_t sequence_st = (status >> 5) & 1;
+    uint8_t liftoff_st = (status >> 6) & 1;
+    uint8_t parachute_st = (status >> 7) & 1;
 
-    // 緯度・経度の出力
-    Serial.printf("Latitude: %ld, Longitude: %ld\r\n", print_TLM.latitude, print_TLM.longitude);
+    double lat_deg = print_TLM.latitude / 10000000.0;
+    double lon_deg = print_TLM.longitude / 10000000.0;
 
-    //  角速度の出力
-    Serial.printf("Angular Velocity  [X: %d, Y: %d, Z: %d]\r\n",
-                  print_TLM.angle_speed[0], print_TLM.angle_speed[1], print_TLM.angle_speed[2]);
+    int32_t height_m = (int32_t)print_TLM.gnss_height * 10;
 
-    //  加速度の出力
-    Serial.printf("Acceleration [X: %d, Y: %d, Z: %d]\r\n",
-                  print_TLM.acceleration[0], print_TLM.acceleration[1], print_TLM.acceleration[2]);
+    Serial.printf(
+        "GNSS [Lat: %.5f deg, Lon: %.5f deg, Height: %ld m]\r\n",
+        lat_deg,
+        lon_deg,
+        (long)height_m);
 
-    //  気圧の出力(raw dataと変換後)
-    Serial.printf("Air Pressure [0: %d, 1: %d, 2: %d]\r\n",
-                  print_TLM.air_pressure[0], print_TLM.air_pressure[1], print_TLM.air_pressure[2]);
-    Serial.printf("Air Pressure: %d Pa\r\n",
-                  print_TLM.air_pressure[0] + 256 * print_TLM.air_pressure[1] + 65536 * print_TLM.air_pressure[2]);
+    if (LORA_APPEND_RSSI)
+    {
+      Serial.printf(
+          "RSSI: %d dBm\r\n",
+          (int)print_TLM.rssi - 256);
+    }
 
-    //  RSSIの出力 (dBm)
-    Serial.printf("RSSI: %d dBm\r\n", (int)print_TLM.rssi - 256);
     Serial.println();
-
-    delay(1500);
   }
 }
