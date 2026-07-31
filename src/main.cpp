@@ -134,6 +134,15 @@ void print_telemetry_task(void *pvParameters)
     uint8_t liftoff_st = (status >> 6) & 1;
     uint8_t parachute_st = (status >> 7) & 1;
 
+    Serial.printf("Top : %s\r\n", top_detect ? "Detected" : "Yet");
+    Serial.printf("Main power: %s\r\n", main_power_st ? "ON" : "OFF");
+    Serial.printf("Emergency power: %s\r\n", emergency_power_st ? "ON" : "OFF");
+    Serial.printf("Control: %s\r\n", control_st ? "Enabled" : "Disabled");
+    Serial.printf("CAN: %s\r\n", can_st ? "OK" : "ERROR");
+    Serial.printf("Sequence: %s\r\n", sequence_st ? "Running" : "IDLE");
+    Serial.printf("Liftoff: %s\r\n", liftoff_st ? "Detected" : "Yet");
+    Serial.printf("Parachute: %s\r\n", parachute_st ? "OPEN" : "CLOSE");
+
     if (top_detect)
       digitalWrite(top_led, HIGH);
     if (liftoff_st)
@@ -145,11 +154,31 @@ void print_telemetry_task(void *pvParameters)
 
     int32_t height_m = (int32_t)print_TLM.gnss_height * 10;
 
+    Serial.printf("Latitude: %.7f deg\r\n", lat_deg);
+    Serial.printf("Longitude: %.7f deg\r\n", lon_deg);
+    Serial.printf("GNSS height: %ld m\r\n", (long)height_m);
     Serial.printf(
-        "GNSS [Lat: %.5f deg, Lon: %.5f deg, Height: %ld m]\r\n",
-        lat_deg,
-        lon_deg,
-        (long)height_m);
+        "Angle speed: [%d, %d, %d]\r\n",
+        (int)print_TLM.angle_speed[0],
+        (int)print_TLM.angle_speed[1],
+        (int)print_TLM.angle_speed[2]);
+    Serial.printf(
+        "Acceleration: [%d, %d, %d]\r\n",
+        (int)print_TLM.acceleration[0],
+        (int)print_TLM.acceleration[1],
+        (int)print_TLM.acceleration[2]);
+    Serial.printf(
+        "Integrated angle: [%d, %d, %d]\r\n",
+        (int)print_TLM.integrated_angle[0],
+        (int)print_TLM.integrated_angle[1],
+        (int)print_TLM.integrated_angle[2]);
+    Serial.printf(
+        "Air pressure: [%u, %u, %u]\r\n",
+        (unsigned int)print_TLM.air_pressure[0],
+        (unsigned int)print_TLM.air_pressure[1],
+        (unsigned int)print_TLM.air_pressure[2]);
+    Serial.printf("Air speed: %u\r\n", (unsigned int)print_TLM.air_speed);
+    Serial.printf("Fin angle: %d\r\n", (int)print_TLM.fin_angle);
 
     if (LORA_APPEND_RSSI)
     {
