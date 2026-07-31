@@ -52,14 +52,6 @@ constexpr uint8_t CMD_CHNNL = 0x04;
 SemaphoreHandle_t TlmMutex;
 TaskHandle_t printTaskHandle = NULL;
 
-enum EraseState
-{
-  STATE_IDLE,
-  STATE_WAIT_CONFIRM
-};
-
-EraseState current_loop_state = STATE_IDLE;
-
 struct TelemetryData
 {
   uint8_t add_h;
@@ -117,6 +109,10 @@ void setup()
 {
   Serial.begin(115200);
   Serial1.begin(115200, SERIAL_8N1, LoRA_RX, LoRA_TX);
+  pinMode(m0, OUTPUT);
+  pinMode(m1, OUTPUT);
+  digitalWrite(m0, LOW);
+  digitalWrite(m1, LOW);
 
   TlmMutex = xSemaphoreCreateMutex();
 
@@ -137,6 +133,7 @@ void setup()
       1,
       &printTaskHandle,
       0);
+  delay(100);
 }
 
 void loop()
@@ -152,56 +149,16 @@ void loop()
       return;
     }
 
-    switch (current_loop_state)
-    {
-    case STATE_IDLE:
-      if (cmd == 'x')
-      {
-        Serial.println("Do you want to erase flash? (y/n)");
-        current_loop_state = STATE_WAIT_CONFIRM;
-      }
-      else
-      {
-        // E220固定送信用コマンド
-        // 例: g -> 00 00 04 67
-        // 例: h -> 00 00 04 68
-        Serial1.write(CMD_PREFIX_0);
-        Serial1.write(CMD_PREFIX_0);
-        Serial1.write(CMD_CHNNL);
-        Serial1.write((uint8_t)cmd);
+    // E220固定送信用コマンド
+    Serial1.write(CMD_PREFIX_0);
+    Serial1.write(CMD_PREFIX_0);
+    Serial1.write(CMD_CHNNL);
 
-        Serial.print("send cmd: ");
-        Serial.println(cmd);
-      }
-      break;
+    Serial1.write((uint8_t)cmd);
 
-    case STATE_WAIT_CONFIRM:
-      if (cmd == 'y')
-      {
-        Serial.println("erase start");
-
-        Serial1.write(CMD_PREFIX_0);
-        Serial1.write(CMD_PREFIX_0);
-        Serial1.write(CMD_CHNNL);
-        Serial1.write((uint8_t)'x');
-
-        Serial.println("send cmd: x");
-        current_loop_state = STATE_IDLE;
-      }
-      else if (cmd == 'n')
-      {
-        Serial.println("erase denied");
-        current_loop_state = STATE_IDLE;
-      }
-      else
-      {
-        Serial.println("try again\npress x to erase flash");
-        current_loop_state = STATE_IDLE;
-      }
-      break;
-    }
+    Serial.print("send cmd: ");
+    Serial.println(cmd);
   }
-
   delay(50);
 }
 
