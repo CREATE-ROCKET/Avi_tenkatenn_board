@@ -9,6 +9,8 @@ namespace
 SemaphoreHandle_t telemetry_mutex = nullptr;
 TaskHandle_t notify_task_handle = nullptr;
 TelemetryData telemetry = {};
+uint32_t last_telemetry_at = 0;
+bool telemetry_is_active = false;
 
 uint8_t calc_checksum(const uint8_t *frame)
 {
@@ -47,6 +49,10 @@ void publish_telemetry(const uint8_t *frame, uint8_t rssi)
   xSemaphoreTake(telemetry_mutex, portMAX_DELAY);
   telemetry = decoded;
   xSemaphoreGive(telemetry_mutex);
+
+  last_telemetry_at = millis();
+  telemetry_is_active = true;
+  digitalWrite(update_led, HIGH);
 
   if (notify_task_handle != nullptr)
   {
@@ -112,6 +118,12 @@ void decode_task(void *pvParameters)
         rx_index = 0;
         break;
       }
+    }
+
+    if (telemetry_is_active && millis() - last_telemetry_at >= TELEMETRY_TIMEOUT_MS)
+    {
+      telemetry_is_active = false;
+      digitalWrite(update_led, LOW);
     }
     delay(15);
   }
