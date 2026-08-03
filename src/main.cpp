@@ -76,7 +76,9 @@ void loop()
     Serial1.write(CMD_PREFIX_0);
     Serial1.write(CMD_CHNNL);
 
+    Serial1.write(HEADER_UP);
     Serial1.write((uint8_t)cmd);
+    Serial1.write(HEADER_UP ^ (uint8_t)cmd);
 
     Serial.print("send cmd: ");
     Serial.println(cmd);

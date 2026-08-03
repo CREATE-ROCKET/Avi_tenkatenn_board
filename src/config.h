@@ -16,6 +16,7 @@ constexpr uint8_t control_led = 13;
 constexpr uint8_t update_led = 14;
 constexpr uint32_t TELEMETRY_TIMEOUT_MS = 5000;
 
+constexpr uint8_t HEADER_UP = 0x55;
 constexpr uint8_t aux = 27;
 constexpr uint8_t LoRA_RX = 26;
 constexpr uint8_t LoRA_TX = 25;
