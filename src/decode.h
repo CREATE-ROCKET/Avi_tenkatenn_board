@@ -7,3 +7,4 @@
 
 void start_decode_task(TaskHandle_t notify_task);
 bool copy_latest_telemetry(TelemetryData &destination);
+uint32_t get_telemetry_sequence();

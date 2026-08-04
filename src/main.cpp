@@ -1,5 +1,6 @@
 #include <Arduino.h>
 #include <freertos/FreeRTOS.h>
+#include <freertos/queue.h>
 #include <freertos/task.h>
 
 #include "config.h"
@@ -7,8 +8,16 @@
 
 TaskHandle_t printTaskHandle = NULL;
 TelemetryData print_TLM;
+QueueHandle_t commandQueue = nullptr;
+
+namespace
+{
+  constexpr UBaseType_t COMMAND_QUEUE_LENGTH = 4;
+}
 
 void print_telemetry_task(void *pvParameters);
+void command_send_task(void *pvParameters);
+bool wait_aux_high(uint32_t timeout_ms);
 void setup_lora_settings();
 
 void setup()
@@ -49,6 +58,22 @@ void setup()
       0);
 
   start_decode_task(printTaskHandle);
+  commandQueue = xQueueCreate(COMMAND_QUEUE_LENGTH, sizeof(uint8_t));
+  if (commandQueue == nullptr)
+  {
+    Serial.println("failed to create command queue");
+    return;
+  }
+
+  xTaskCreateUniversal(
+      command_send_task,
+      "command_send_task",
+      3072,
+      NULL,
+      2,
+      nullptr,
+      0);
+
   delay(100);
 }
 
@@ -60,30 +85,94 @@ void loop()
     return;
   }
 
-  if (Serial.available())
+  while (Serial.available() > 0)
   {
-    char cmd = Serial.read();
+    const char cmd = static_cast<char>(Serial.read());
 
-    // シリアルモニタの改行を無視
     if (cmd == '\r' || cmd == '\n')
     {
-      delay(50);
-      return;
+      continue;
     }
 
-    // E220固定送信用コマンド
-    Serial1.write(CMD_PREFIX_0);
-    Serial1.write(CMD_PREFIX_0);
-    Serial1.write(CMD_CHNNL);
+    const uint8_t command = static_cast<uint8_t>(cmd);
+    if (commandQueue == nullptr ||
+        xQueueSend(commandQueue, &command, 0) != pdPASS)
+    {
+      Serial.println("command queue full");
+      continue;
+    }
 
-    Serial1.write(HEADER_UP);
-    Serial1.write((uint8_t)cmd);
-    Serial1.write(HEADER_UP ^ (uint8_t)cmd);
-
-    Serial.print("send cmd: ");
+    Serial.print("command queued: ");
     Serial.println(cmd);
   }
-  delay(50);
+
+  delay(10);
+}
+
+bool wait_aux_high(uint32_t timeout_ms)
+{
+  const uint32_t started_at = millis();
+
+  while (digitalRead(aux) != HIGH)
+  {
+    if (millis() - started_at >= timeout_ms)
+    {
+      return false;
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(AUX_POLL_INTERVAL_MS));
+  }
+
+  return true;
+}
+
+void command_send_task(void *pvParameters)
+{
+  uint8_t command = 0;
+
+  while (true)
+  {
+    if (xQueueReceive(commandQueue, &command, portMAX_DELAY) != pdPASS)
+    {
+      continue;
+    }
+
+    const uint32_t sequence_at_dequeue = get_telemetry_sequence();
+    while (get_telemetry_sequence() <= sequence_at_dequeue)
+    {
+      vTaskDelay(pdMS_TO_TICKS(1));
+    }
+
+    Serial.println("telemetry received, waiting AUX");
+
+    if (!wait_aux_high(AUX_TIMEOUT_MS))
+    {
+      Serial.print("AUX timeout, command cancelled: ");
+      Serial.println(static_cast<char>(command));
+      continue;
+    }
+
+    const uint8_t send_data[] = {
+        CMD_PREFIX_0,
+        CMD_PREFIX_0,
+        CMD_CHNNL,
+        HEADER_UP,
+        command,
+        HEADER_UP ^ command};
+
+    Serial1.write(send_data, sizeof(send_data));
+    Serial1.flush();
+
+    if (!wait_aux_high(AUX_TIMEOUT_MS))
+    {
+      Serial.print("AUX timeout after send: ");
+      Serial.println(static_cast<char>(command));
+      continue;
+    }
+
+    Serial.print("send cmd: ");
+    Serial.println(static_cast<char>(command));
+  }
 }
 
 void setup_lora_settings()

@@ -15,6 +15,8 @@ constexpr uint8_t liftoff_led = 21;
 constexpr uint8_t control_led = 13;
 constexpr uint8_t update_led = 14;
 constexpr uint32_t TELEMETRY_TIMEOUT_MS = 5000;
+constexpr uint32_t AUX_TIMEOUT_MS = 2000;
+constexpr uint32_t AUX_POLL_INTERVAL_MS = 1;
 
 constexpr uint8_t HEADER_UP = 0x55;
 constexpr uint8_t aux = 27;
