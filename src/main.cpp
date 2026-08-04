@@ -152,13 +152,16 @@ void command_send_task(void *pvParameters)
       continue;
     }
 
+    const uint8_t checksum =
+        static_cast<uint8_t>(HEADER_UP ^ command);
+
     const uint8_t send_data[] = {
         CMD_PREFIX_0,
         CMD_PREFIX_0,
         CMD_CHNNL,
         HEADER_UP,
         command,
-        HEADER_UP ^ command};
+        checksum};
 
     Serial1.write(send_data, sizeof(send_data));
     Serial1.flush();
@@ -205,11 +208,17 @@ void setup_lora_settings()
 
 void print_telemetry_task(void *pvParameters)
 {
+  uint32_t receive_interval_ms = 0;
+  bool has_receive_interval = false;
+
   while (1)
   {
     ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
 
-    if (!copy_latest_telemetry(print_TLM))
+    if (!copy_latest_telemetry(
+            print_TLM,
+            receive_interval_ms,
+            has_receive_interval))
     {
       continue;
     }
@@ -233,6 +242,17 @@ void print_telemetry_task(void *pvParameters)
     Serial.printf("Sequence: %s\r\n", sequence_st ? "Running" : "IDLE");
     Serial.printf("Liftoff: %s\r\n", liftoff_st ? "Detected" : "Yet");
     Serial.printf("Parachute: %s\r\n", parachute_st ? "OPEN" : "CLOSE");
+
+    if (has_receive_interval)
+    {
+      Serial.print("Receive interval: ");
+      Serial.print(receive_interval_ms / 1000.0, 3);
+      Serial.println(" s");
+    }
+    else
+    {
+      Serial.println("Receive interval: N/A");
+    }
 
     if (top_detect)
       digitalWrite(top_led, HIGH);

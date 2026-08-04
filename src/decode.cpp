@@ -11,6 +11,8 @@ namespace
   TelemetryData telemetry = {};
   uint32_t telemetry_sequence = 0;
   uint32_t last_telemetry_at = 0;
+  uint32_t receive_interval_ms = 0;
+  bool has_receive_interval = false;
   bool telemetry_is_active = false;
 
   uint8_t calc_checksum(const uint8_t *frame)
@@ -47,12 +49,19 @@ namespace
   void publish_telemetry(const uint8_t *frame, uint8_t rssi)
   {
     const TelemetryData decoded = decode_telemetry(frame, rssi);
+    const uint32_t received_at = millis();
+
     xSemaphoreTake(telemetry_mutex, portMAX_DELAY);
     telemetry = decoded;
+    has_receive_interval = telemetry_sequence > 0;
+    if (has_receive_interval)
+    {
+      receive_interval_ms = received_at - last_telemetry_at;
+    }
+    last_telemetry_at = received_at;
     telemetry_sequence++;
     xSemaphoreGive(telemetry_mutex);
 
-    last_telemetry_at = millis();
     telemetry_is_active = true;
     digitalWrite(update_led, HIGH);
 
@@ -211,7 +220,10 @@ void start_decode_task(TaskHandle_t notify_task)
   xTaskCreateUniversal(decode_task, "decode_task", 4096, nullptr, 3, nullptr, 0);
 }
 
-bool copy_latest_telemetry(TelemetryData &destination)
+bool copy_latest_telemetry(
+    TelemetryData &destination,
+    uint32_t &destination_receive_interval_ms,
+    bool &destination_has_receive_interval)
 {
   if (telemetry_mutex == nullptr)
   {
@@ -219,6 +231,8 @@ bool copy_latest_telemetry(TelemetryData &destination)
   }
   xSemaphoreTake(telemetry_mutex, portMAX_DELAY);
   destination = telemetry;
+  destination_receive_interval_ms = receive_interval_ms;
+  destination_has_receive_interval = has_receive_interval;
   xSemaphoreGive(telemetry_mutex);
   return true;
 }

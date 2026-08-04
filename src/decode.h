@@ -6,5 +6,8 @@
 #include "config.h"
 
 void start_decode_task(TaskHandle_t notify_task);
-bool copy_latest_telemetry(TelemetryData &destination);
+bool copy_latest_telemetry(
+    TelemetryData &destination,
+    uint32_t &receive_interval_ms,
+    bool &has_receive_interval);
 uint32_t get_telemetry_sequence();
