@@ -1,251 +1,185 @@
 #include "decode.h"
 
 #include <Arduino.h>
-#include <freertos/semphr.h>
-#include <string.h>
+#include <atomic>
 
 namespace
 {
-  SemaphoreHandle_t telemetry_mutex = nullptr;
-  TaskHandle_t notify_task_handle = nullptr;
-  TelemetryData telemetry = {};
-  uint32_t telemetry_sequence = 0;
-  uint32_t last_telemetry_at = 0;
-  uint32_t receive_interval_ms = 0;
-  bool has_receive_interval = false;
-  bool telemetry_is_active = false;
+  constexpr UBaseType_t PACKET_QUEUE_LENGTH = 16;
+  QueueHandle_t packet_queue = nullptr;
+  uint32_t packet_sequence = 0;
+  uint32_t last_packet_at = 0;
+  bool packet_is_active = false;
+  std::atomic<uint32_t> packet_drop_count{0};
 
-  uint8_t calc_checksum(const uint8_t *frame)
+  void publish_packet(
+      const protocol::DecodedPacket &packet,
+      uint8_t rssi,
+      bool has_rssi)
   {
-    uint8_t checksum = 0;
-    for (uint8_t i = CHECKSUM_START_OFFSET; i <= CHECKSUM_END_OFFSET; i++)
-    {
-      checksum ^= frame[i];
-    }
-    return checksum;
-  }
-
-  TelemetryData decode_telemetry(const uint8_t *buffer, uint8_t rssi)
-  {
-    TelemetryData result;
-    result.add_h = buffer[0];
-    result.add_l = buffer[1];
-    result.chnnl = buffer[2];
-    result.header1 = buffer[3];
-    result.status = buffer[4];
-    memcpy(&result.latitude, &buffer[5], sizeof(result.latitude));
-    memcpy(&result.longitude, &buffer[9], sizeof(result.longitude));
-    memcpy(&result.gnss_height, &buffer[13], sizeof(result.gnss_height));
-    memcpy(result.angle_speed, &buffer[15], sizeof(result.angle_speed));
-    memcpy(result.acceleration, &buffer[21], sizeof(result.acceleration));
-    memcpy(result.integrated_angle, &buffer[27], sizeof(result.integrated_angle));
-    memcpy(result.air_pressure, &buffer[33], sizeof(result.air_pressure));
-    result.air_speed = buffer[36];
-    memcpy(&result.fin_angle, &buffer[37], sizeof(result.fin_angle));
-    result.rssi = rssi;
-    return result;
-  }
-
-  void publish_telemetry(const uint8_t *frame, uint8_t rssi)
-  {
-    const TelemetryData decoded = decode_telemetry(frame, rssi);
     const uint32_t received_at = millis();
+    const bool has_interval = packet_sequence > 0;
+    const ReceivedPacket received{
+        packet,
+        rssi,
+        has_rssi,
+        received_at,
+        has_interval ? received_at - last_packet_at : 0,
+        has_interval};
+    last_packet_at = received_at;
+    ++packet_sequence;
 
-    xSemaphoreTake(telemetry_mutex, portMAX_DELAY);
-    telemetry = decoded;
-    has_receive_interval = telemetry_sequence > 0;
-    if (has_receive_interval)
+    if (packet_queue == nullptr ||
+        xQueueSend(packet_queue, &received, 0) != pdPASS)
     {
-      receive_interval_ms = received_at - last_telemetry_at;
+      packet_drop_count.fetch_add(1, std::memory_order_relaxed);
     }
-    last_telemetry_at = received_at;
-    telemetry_sequence++;
-    xSemaphoreGive(telemetry_mutex);
 
-    telemetry_is_active = true;
+    packet_is_active = true;
     digitalWrite(update_led, HIGH);
-
-    if (notify_task_handle != nullptr)
-    {
-      xTaskNotifyGive(notify_task_handle);
-    }
   }
 
   void decode_task(void *pvParameters)
   {
     constexpr uint32_t FRAME_GAP_TIMEOUT_MS = 100;
+    enum class ReceiveState : uint8_t
+    {
+      Header,
+      ApplicationFrame,
+      Rssi,
+    };
 
-    uint8_t state = 0;
-    uint8_t rx_index = 0;
-    uint8_t frame[TX_FRAME_SIZE] = {};
-
+    ReceiveState state = ReceiveState::Header;
+    uint8_t frame[protocol::MAX_APPLICATION_FRAME_SIZE] = {};
+    std::size_t frame_length = 0;
+    std::size_t expected_length = 0;
     uint32_t last_byte_at = 0;
+    protocol::DecodedPacket pending_packet{};
+
+    const auto start_frame = [&](uint8_t value) {
+      expected_length = protocol::expectedApplicationLength(value);
+      if (expected_length == 0)
+      {
+        state = ReceiveState::Header;
+        frame_length = 0;
+        return;
+      }
+      frame[0] = value;
+      frame_length = 1;
+      state = ReceiveState::ApplicationFrame;
+    };
 
     while (true)
     {
-      /*
-       * フレーム受信途中で一定時間byteが来なければ破棄する。
-       *
-       * これがないと、欠落したフレームと次のフレームが結合され、
-       * チェックサム位置やRSSI位置がずれる。
-       */
-      if (state != 0 &&
+      if (state != ReceiveState::Header &&
           millis() - last_byte_at >= FRAME_GAP_TIMEOUT_MS)
       {
-        state = 0;
-        rx_index = 0;
+        if (state == ReceiveState::Rssi)
+        {
+          // RSSIが欠落しても検証済みapplication packetは保持する。
+          publish_packet(pending_packet, 0, false);
+        }
+        state = ReceiveState::Header;
+        frame_length = 0;
       }
 
       while (Serial1.available() > 0)
       {
         const int read_value = Serial1.read();
-
         if (read_value < 0)
         {
           break;
         }
 
-        const uint8_t value =
-            static_cast<uint8_t>(read_value);
-
+        const uint8_t value = static_cast<uint8_t>(read_value);
         last_byte_at = millis();
 
-        switch (state)
+        if (state == ReceiveState::Header)
         {
-        /*
-         * ヘッダー0xAA待ち
-         */
-        case 0:
-          if (value == HEADER1)
-          {
-            // E220の固定送信用3 bytesは無線受信側では届かないため、
-            // 受信側で復元する。
-            frame[0] = ADD_H;
-            frame[1] = ADD_L;
-            frame[2] = CHNNL;
-            frame[3] = value;
+          start_frame(value);
+          continue;
+        }
 
-            rx_index = 4;
-            state = 1;
-          }
-          break;
+        if (state == ReceiveState::Rssi)
+        {
+          publish_packet(pending_packet, value, value != 0);
+          state = ReceiveState::Header;
+          frame_length = 0;
+          continue;
+        }
 
-        /*
-         * Payload本体受信
-         */
-        case 1:
-          if (rx_index >= TX_FRAME_SIZE)
-          {
-            state = 0;
-            rx_index = 0;
-            break;
-          }
+        if (frame_length >= sizeof(frame))
+        {
+          state = ReceiveState::Header;
+          frame_length = 0;
+          start_frame(value);
+          continue;
+        }
 
-          frame[rx_index++] = value;
+        frame[frame_length++] = value;
+        if (frame_length != expected_length)
+        {
+          continue;
+        }
 
-          if (rx_index == TX_FRAME_SIZE)
-          {
-            const uint8_t calculated =
-                calc_checksum(frame);
+        protocol::DecodeError error = protocol::DecodeError::None;
+        if (!protocol::decodeApplicationFrame(
+                frame, frame_length, pending_packet, error))
+        {
+          Serial.print("LoRa frame rejected: ");
+          Serial.println(protocol::decodeErrorName(error));
+          state = ReceiveState::Header;
+          frame_length = 0;
+          start_frame(value);
+          continue;
+        }
 
-            const uint8_t received =
-                frame[CHECKSUM_OFFSET];
-
-            if (calculated != received)
-            {
-              // チェックサム不一致。
-              // 次の0xAAから再同期する。
-              state = 0;
-              rx_index = 0;
-              break;
-            }
-
-            if (LORA_APPEND_RSSI)
-            {
-              // 次の1 byteをRSSIとして待つ。
-              state = 2;
-            }
-            else
-            {
-              publish_telemetry(frame, 0);
-
-              state = 0;
-              rx_index = 0;
-            }
-          }
-          break;
-
-        /*
-         * RSSI byte受信
-         */
-        case 2:
-          /*
-           * raw RSSI == 0は正常なRSSI値として扱わない。
-           *
-           * 0 - 256 = -256 dBmとなるが、これは実際の受信電力ではなく、
-           * フレーム同期ずれまたはRSSI未取得を示す。
-           */
-          if (value != 0x00)
-          {
-            publish_telemetry(frame, value);
-          }
-
-          state = 0;
-          rx_index = 0;
-          break;
-
-        default:
-          state = 0;
-          rx_index = 0;
-          break;
+        if (LORA_APPEND_RSSI)
+        {
+          state = ReceiveState::Rssi;
+        }
+        else
+        {
+          publish_packet(pending_packet, 0, false);
+          state = ReceiveState::Header;
+          frame_length = 0;
         }
       }
 
-      if (telemetry_is_active &&
-          millis() - last_telemetry_at >= TELEMETRY_TIMEOUT_MS)
+      if (packet_is_active &&
+          millis() - last_packet_at >= TELEMETRY_TIMEOUT_MS)
       {
-        telemetry_is_active = false;
+        packet_is_active = false;
         digitalWrite(update_led, LOW);
       }
 
       delay(1);
     }
   }
-} // namespace
+} // 無名名前空間
 
-void start_decode_task(TaskHandle_t notify_task)
+bool start_decode_task()
 {
-  notify_task_handle = notify_task;
-  telemetry_mutex = xSemaphoreCreateMutex();
-  xTaskCreateUniversal(decode_task, "decode_task", 4096, nullptr, 3, nullptr, 0);
+  packet_queue = xQueueCreate(PACKET_QUEUE_LENGTH, sizeof(ReceivedPacket));
+  if (packet_queue == nullptr)
+  {
+    Serial.println("failed to create packet queue");
+    return false;
+  }
+  return xTaskCreateUniversal(
+             decode_task, "decode_task", 4096, nullptr, 3, nullptr, 0) == pdPASS;
 }
 
-bool copy_latest_telemetry(
-    TelemetryData &destination,
-    uint32_t &destination_receive_interval_ms,
-    bool &destination_has_receive_interval)
+bool receive_packet(ReceivedPacket &destination, TickType_t timeout)
 {
-  if (telemetry_mutex == nullptr)
+  if (packet_queue == nullptr)
   {
     return false;
   }
-  xSemaphoreTake(telemetry_mutex, portMAX_DELAY);
-  destination = telemetry;
-  destination_receive_interval_ms = receive_interval_ms;
-  destination_has_receive_interval = has_receive_interval;
-  xSemaphoreGive(telemetry_mutex);
-  return true;
+  return xQueueReceive(packet_queue, &destination, timeout) == pdPASS;
 }
 
-uint32_t get_telemetry_sequence()
+uint32_t dropped_packet_count()
 {
-  if (telemetry_mutex == nullptr)
-  {
-    return 0;
-  }
-
-  xSemaphoreTake(telemetry_mutex, portMAX_DELAY);
-  const uint32_t sequence = telemetry_sequence;
-  xSemaphoreGive(telemetry_mutex);
-  return sequence;
+  return packet_drop_count.load(std::memory_order_relaxed);
 }

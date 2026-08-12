@@ -193,6 +193,13 @@ namespace
     assert(!protocol::decodeApplicationFrame(
         bad_log.data() + 3, bad_log.size() - 3, packet, error));
     assert(error == protocol::DecodeError::InvalidField);
+
+    auto bad_time = vectors.at("LORA_TIME_REQUEST");
+    bad_time[4] = 0;
+    bad_time.back() = protocol::xorChecksum(bad_time.data() + 3, bad_time.size() - 4);
+    assert(!protocol::decodeApplicationFrame(
+        bad_time.data() + 3, bad_time.size() - 3, packet, error));
+    assert(error == protocol::DecodeError::InvalidField);
   }
 
   void testScalarSemantics(const std::map<std::string, std::vector<uint8_t>> &vectors)

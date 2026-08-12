@@ -284,6 +284,11 @@ namespace protocol
     {
       uint8_t header = 0;
       valid = read(reader, 8, header) && read(reader, 8, packet.time_request.request_id);
+      if (valid && packet.time_request.request_id == 0)
+      {
+        decode_error = DecodeError::InvalidField;
+        return false;
+      }
       break;
     }
     }
