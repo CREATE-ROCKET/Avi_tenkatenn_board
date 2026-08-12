@@ -1,53 +1,61 @@
-# receicer_tennkaten
+# 99L Ground Station
 
-ESP32とE220 LoRaモジュールを使用し、テレメトリを受信・表示するPlatformIOプロジェクトです。
-通常通信モードに加えて、E220へ設定を書き込むための設定モードを備えています。
+ESP32とE220を使用する99L地上局受信機です。対象branchは`vault`です。
 
-## ファイル構成
+## Architecture
 
-- `src/main.cpp`: Arduinoの`setup()` / `loop()`、起動モードの分岐、コマンド送信、LED表示、テレメトリ表示を担当します。
-- `src/config.h`: 起動モード、ピン番号、E220設定値、フレーム定数、`TelemetryData`を定義します。
-- `src/decode.h`: デコード処理を開始し、最新テレメトリを取得するための公開APIです。
-- `src/decode.cpp`: LoRa受信、フレーム検出、チェックサム検証、テレメトリ変換と共有を担当します。
-- `platformio.ini`: 対象ボード、シリアル速度などのPlatformIO設定です。
+- `src/protocol.*`: Vault 04/04aのLSB-first compact packet、XOR、semantic error、11 byte uplink、pending transaction IDを扱うpure codecです。
+- `src/decode.*`: E220 UARTの所有taskです。header別の可変長を判定し、XOR検証済みpacketを16件のbounded queueへ渡します。UART末尾のRSSIはapplication packetの外側として扱います。
+- `src/main.cpp`: packet表示task、uplink送信task、console入力を担当します。送信taskだけがtransaction ID stateとUART TXを所有します。
+- E220 PHY設定、pin、LED、設定modeは従来構成を維持しています。
 
-## 通常通信モード
+受信packetはA0、A1〜A3、A4、A5、A6、B0、B1です。E220固定送信prefix `00 00 04`はGround側UARTへ届かない前提で、XOR対象に含めません。bit packingはLSB-firstです。
 
-`src/config.h`を次の設定にします。
+## Build / flash / run
 
-```cpp
-constexpr BootMode BOOT_MODE = BootMode::Communication;
+```sh
+/home/hotaru/.platformio/penv/bin/pio run
+/home/hotaru/.platformio/penv/bin/pio run -t upload --upload-port /dev/ttyUSB<N>
+/home/hotaru/.platformio/penv/bin/pio device monitor -p /dev/ttyUSB<N> -b 115200
 ```
 
-起動後はLoRaから受信したフレームを検証・デコードし、GNSS情報とRSSIをシリアルモニタへ表示します。
-シリアルモニタから入力した1文字は、E220の固定送信形式で送信されます。
+`<N>`を推測しないでください。`udevadm info --name=/dev/ttyUSB<N>`と既存boot logでGround Stationを識別してからflashします。
 
-## LoRa設定モード
+E220設定を書き込む場合だけ`src/config.h`の`BOOT_MODE`を`LoRaSetup`へ変更し、書込み後は必ず`Communication`へ戻して再flashします。設定値、pin、LoRa channelは既存値を維持しています。
 
-E220の設定を書き込む場合は、`src/config.h`を次のように変更します。
+## Command console
 
-```cpp
-constexpr BootMode BOOT_MODE = BootMode::LoRaSetup;
+115200 bpsのUSB consoleで以下を使用します。数値はdecimalまたは`0x`付きhexです。
+
+```text
+g <command> [arg0 ... arg5]
+ae
+le
+local <command> [arg0 ... arg5]
+time <request_id> <unix_seconds> <milliseconds>
 ```
 
-設定手順:
+- `g`: Mission generic command。unused argは省略すると0です。
+- `ae`: ActuatorEmergencyStop専用frame。
+- `le`: LiftoffDetectionEmergencyStop専用frame。
+- `local`: ComBoard local command。既存logging/GNSS codeは`0x6c/0x6d/0x67/0x68`です。
+- `time`: B1に表示されたrequest IDへGround sourceの時刻を応答します。
 
-1. `BOOT_MODE`を`BootMode::LoRaSetup`へ変更します。
-2. 使用するボードへファームウェアを書き込みます。
-3. 115200 bpsのシリアルモニタで設定結果を確認します。
-4. `BOOT_MODE`を`BootMode::Communication`へ戻します。
-5. 通常運用用ファームウェアを再度書き込みます。
+transaction ID 0は使用せず、同時pendingは16件までです。B0のAcceptedでは保持し、Completed/Rejected/Failedで解放します。送信失敗時もIDを解放します。
 
-設定モードではM0/M1をHIGHにして、`settingCmd`をE220へ送信します。通常の受信タスクとコマンド送信は動作しません。
-設定値、LoRaアドレス、チャンネル、ピン番号を変更する場合は`src/config.h`を編集します。
+## Test
 
-## LED
+```sh
+sh test/run_host_tests.sh
+/home/hotaru/.platformio/penv/bin/pio run
+```
 
-- `top_led`: テレメトリの頂点検知状態で点灯します。
-- `liftoff_led`: リフトオフ状態で点灯します。
-- `control_led`: 制御状態で点灯します。
-- `update_led`: 正常なテレメトリ受信で点灯し、5秒間受信がない場合に消灯します。
+host testはMission/ComBoardとbyte-identicalな`testdata/99l_protocol_golden_vectors.txt`を読み、packet、bit境界、signed値、reserved/error、padding、checksum、uplink、transaction lifecycleを検証します。
 
-## PlatformIO環境
+## Hardware assumptions / known limitations
 
-- `esp32doit-devkit-v1`: DOIT ESP32 DEVKIT V1
+- E220はUART 115200 bps、SF8/BW125、CH4、append-RSSIの既存設定を前提とします。
+- A0 status bitとA6/B0/B1 layout、requested torque scaleはVaultの実装仮定台帳に記録した暫定値です。
+- packet queue overflow時はdrop countをconsoleへ表示します。永続logはGround Stationの責務外です。
+- RSSI欠落時もXOR検証済みapplication packetを破棄せず、RSSI unavailableとして表示します。
+- LEDは受信したMission packet headerに基づく表示です。A0 statusの任意bitをactuator commandとして使用しません。
