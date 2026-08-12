@@ -33,6 +33,7 @@ ae
 le
 local <command> [arg0 ... arg5]
 time <request_id> <unix_seconds> <milliseconds>
+release <transaction_id>
 ```
 
 - `g`: Mission generic command。unused argは省略すると0です。
@@ -40,8 +41,9 @@ time <request_id> <unix_seconds> <milliseconds>
 - `le`: LiftoffDetectionEmergencyStop専用frame。
 - `local`: ComBoard local command。既存logging/GNSS codeは`0x6c/0x6d/0x67/0x68`です。
 - `time`: B1に表示されたrequest IDへGround sourceの時刻を応答します。
+- `release`: B0終端結果を受信できなかったpending IDを、operator確認後に解放します。自動再送はせず、再入力したcommandには新しいIDを割り当てます。
 
-transaction ID 0は使用せず、同時pendingは16件までです。B0のAcceptedでは保持し、Completed/Rejected/Failedで解放します。送信失敗時もIDを解放します。
+transaction ID 0は使用せず、同時pendingは16件までです。B0のAcceptedでは保持し、Completed/Rejected/Failedで解放します。送信失敗時もIDを解放します。B0を喪失したpendingには自動timeoutを設けていないため、Mission/ComBoardの状態を確認してから`release`を実行してください。
 
 ## Test
 
@@ -56,6 +58,7 @@ host testはMission/ComBoardとbyte-identicalな`testdata/99l_protocol_golden_ve
 
 - E220はUART 115200 bps、SF8/BW125、CH4、append-RSSIの既存設定を前提とします。
 - A0 status bitとA6/B0/B1 layout、requested torque scaleはVaultの実装仮定台帳に記録した暫定値です。
+- A0のfin/para mode 6〜14はreservedとしてpacketを保持し、表示上は`Unknown`へ正規化します。
 - packet queue overflow時はdrop countをconsoleへ表示します。永続logはGround Stationの責務外です。
 - RSSI欠落時もXOR検証済みapplication packetを破棄せず、RSSI unavailableとして表示します。
 - LEDは受信したMission packet headerに基づく表示です。A0 statusの任意bitをactuator commandとして使用しません。

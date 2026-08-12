@@ -210,6 +210,8 @@ namespace protocol
   SemanticValue decodeBattery(uint8_t raw);
   const char *phaseName(uint8_t phase);
   const char *reasonName(uint8_t reason);
+  const char *finModeName(uint8_t mode);
+  const char *paraModeName(uint8_t mode);
   const char *decodeErrorName(DecodeError error);
 
   class TransactionTracker

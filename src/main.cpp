@@ -27,6 +27,7 @@ namespace
     ComBoardLocal,
     GroundTimeResponse,
     Result,
+    ReleaseTransaction,
   };
 
   struct CommandMessage
@@ -91,6 +92,7 @@ namespace
     Serial.println("  ae | le");
     Serial.println("  local <command> [arg0 ... arg5]");
     Serial.println("  time <request_id> <unix_seconds> <milliseconds>");
+    Serial.println("  release <transaction_id>");
     Serial.println("values accept decimal or 0x-prefixed hexadecimal");
   }
 
@@ -172,6 +174,22 @@ namespace
           static_cast<uint8_t>(seconds >> 24U),
           static_cast<uint8_t>(milliseconds),
           static_cast<uint8_t>(milliseconds >> 8U)};
+      enqueueCommand(message);
+      return;
+    }
+
+    if (std::strcmp(operation, "release") == 0)
+    {
+      char *transaction_text = strtok_r(nullptr, " \t", &save);
+      uint32_t transaction_id = 0;
+      if (!parseUnsigned(transaction_text, UINT8_MAX, transaction_id) ||
+          transaction_id == 0 || strtok_r(nullptr, " \t", &save) != nullptr)
+      {
+        Serial.println("usage: release <transaction_id 1..255>");
+        return;
+      }
+      message.kind = CommandMessageKind::ReleaseTransaction;
+      message.command = static_cast<uint8_t>(transaction_id);
       enqueueCommand(message);
       return;
     }
@@ -307,9 +325,11 @@ namespace
         "Para busy", "Gyro bias", "Gravity reference", "SSC zero",
         "Flash data", "Flash health", "Profile valid", "Fin disabled",
         "Calibration busy"};
-    Serial.printf("CommandReceive status: 0x%06lX profile=%u fin_mode=%u para_mode=%u\r\n",
+    Serial.printf("CommandReceive status: 0x%06lX profile=%u fin_mode=%s para_mode=%s\r\n",
                   static_cast<unsigned long>(value.status),
-                  value.motor_profile, value.fin_mode, value.para_mode);
+                  value.motor_profile,
+                  protocol::finModeName(value.fin_mode),
+                  protocol::paraModeName(value.para_mode));
     for (uint8_t bit = 0; bit < 24; ++bit)
     {
       Serial.printf("  %-18s: %s\r\n", status_names[bit],
@@ -479,6 +499,14 @@ namespace
           Serial.printf("unmatched CommandResult id=%u command=0x%02X\r\n",
                         message.result.transaction_id, message.result.command);
         }
+        continue;
+      }
+      if (message.kind == CommandMessageKind::ReleaseTransaction)
+      {
+        Serial.printf("transaction id=%u %s\r\n", message.command,
+                      transaction_tracker.release(message.command)
+                          ? "released"
+                          : "was not pending");
         continue;
       }
 

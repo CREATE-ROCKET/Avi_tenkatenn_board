@@ -54,6 +54,32 @@ namespace
     return packet;
   }
 
+  protocol::DecodedPacket decodeFlightVariant(
+      const std::map<std::string, std::vector<uint8_t>> &vectors,
+      protocol::PacketHeader header)
+  {
+    std::vector<uint8_t> wire = vectors.at("LORA_FLIGHT");
+    wire[3] = static_cast<uint8_t>(header);
+    wire.back() = protocol::xorChecksum(wire.data() + 3, wire.size() - 4);
+    protocol::DecodedPacket packet{};
+    protocol::DecodeError error = protocol::DecodeError::None;
+    assert(protocol::decodeApplicationFrame(
+        wire.data() + 3, wire.size() - 3, packet, error));
+    return packet;
+  }
+
+  void assertNumeric(protocol::SemanticValue value, int32_t count)
+  {
+    assert(value.numeric);
+    assert(value.count == count);
+  }
+
+  void assertStatus(protocol::SemanticValue value, const char *status)
+  {
+    assert(!value.numeric);
+    assert(std::string(value.status) == status);
+  }
+
   uint8_t raw8(
       const std::map<std::string, std::vector<uint8_t>> &vectors,
       const std::string &name)
@@ -73,10 +99,11 @@ namespace
            static_cast<uint16_t>(bytes[1]) << 8;
   }
 
-  void testGoldenPackets(const std::map<std::string, std::vector<uint8_t>> &vectors)
+  void assertFlightFields(
+      const protocol::DecodedPacket &flight,
+      protocol::PacketHeader header)
   {
-    const auto flight = decode(vectors, "LORA_FLIGHT");
-    assert(flight.header == protocol::PacketHeader::Control);
+    assert(flight.header == header);
     assert(flight.flight.status == 0xA55A);
     assert(flight.flight.roll == 0xFFFE);
     assert(flight.flight.roll_rate == 0x04D2);
@@ -89,23 +116,63 @@ namespace
     assert(flight.flight.airspeed == 0x3D);
     assert(flight.flight.requested_torque == 0x0F85);
     assert(flight.flight.elapsed == 0x7B);
+    assert(flight.flight.east == 0xFFF4);
+    assert(flight.flight.north == 0x0022);
+    assert(flight.flight.height == 0x0028);
+  }
+
+  void testGoldenPackets(const std::map<std::string, std::vector<uint8_t>> &vectors)
+  {
+    assertFlightFields(
+        decodeFlightVariant(vectors, protocol::PacketHeader::LiftoffDetection),
+        protocol::PacketHeader::LiftoffDetection);
+    assertFlightFields(
+        decodeFlightVariant(vectors, protocol::PacketHeader::EngineBurn),
+        protocol::PacketHeader::EngineBurn);
+    assertFlightFields(decode(vectors, "LORA_FLIGHT"), protocol::PacketHeader::Control);
 
     const auto command_receive = decode(vectors, "LORA_COMMAND_RECEIVE");
     assert(command_receive.header == protocol::PacketHeader::CommandReceive);
     assert(command_receive.command_receive.status == 0xABCDEF);
     assert(command_receive.command_receive.motor_profile == 3);
+    assert(command_receive.command_receive.tilt_magnitude == 27);
+    assert(command_receive.command_receive.tilt_direction == 281);
+    assert(command_receive.command_receive.fin_mode == 3);
+    assert(command_receive.command_receive.para_mode == 1);
+    assert(command_receive.command_receive.fin_angle == 120);
+    assert(command_receive.command_receive.para_angle == 60);
+    assert(command_receive.command_receive.pressure == 1066);
+    assert(command_receive.command_receive.temperature == 70);
+    assert(command_receive.command_receive.airspeed == 249);
+    assert(command_receive.command_receive.logic_voltage == 160);
+    assert(command_receive.command_receive.motor_voltage == 220);
+    assert(command_receive.command_receive.east == 0x8001);
+    assert(command_receive.command_receive.north == 0x8001);
+    assert(command_receive.command_receive.height == 497);
 
     const auto descent = decode(vectors, "LORA_DESCENT");
     assert(descent.header == protocol::PacketHeader::Descent);
     assert(descent.descent.status == 0x1A55);
+    assert(((descent.descent.status >> 2U) & 0x03U) == 1);
     assert(descent.descent.pressure == 0x07F7);
+    assert(descent.descent.temperature == 0xF7);
+    assert(descent.descent.para_angle == 0xF7);
+    assert(descent.descent.elapsed == 0xFFFA);
+    assert(descent.descent.east == 0x8002);
+    assert(descent.descent.north == 0xFFFF);
+    assert(descent.descent.height == 0x01F2);
 
     const auto recovery = decode(vectors, "LORA_RECOVERY");
     assert(recovery.header == protocol::PacketHeader::RecoveryBeacon);
     assert(recovery.recovery.logic_voltage == 0xA0);
     assert(recovery.recovery.motor_voltage == 0xF0);
+    assert(recovery.recovery.east == 100);
+    assert(recovery.recovery.north == 0xFF9C);
+    assert(recovery.recovery.height == 60);
+    assert(recovery.recovery.elapsed == 12);
 
     const auto log = decode(vectors, "LORA_LOG_DATA");
+    assert(log.header == protocol::PacketHeader::RecoveryLogData);
     assert(log.recovery_log.transfer_id == 0x34);
     assert(log.recovery_log.meta == 0x03);
     assert(log.recovery_log.offset == 0x012345);
@@ -113,8 +180,11 @@ namespace
     assert(log.recovery_log.data[0] == 0xDE);
     assert(log.recovery_log.data[1] == 0xAD);
     assert(log.recovery_log.data[2] == 0xBE);
+    for (std::size_t index = 3; index < log.recovery_log.data.size(); ++index)
+      assert(log.recovery_log.data[index] == 0);
 
     const auto result = decode(vectors, "LORA_COMMAND_RESULT");
+    assert(result.header == protocol::PacketHeader::CommandResult);
     assert(result.command_result.transaction_id == 0x2A);
     assert(result.command_result.command == 0x13);
     assert(result.command_result.phase == 3);
@@ -122,7 +192,25 @@ namespace
     assert(result.command_result.detail == 0x12345678);
 
     const auto time_request = decode(vectors, "LORA_TIME_REQUEST");
+    assert(time_request.header == protocol::PacketHeader::GroundTimeRequest);
     assert(time_request.time_request.request_id == 7);
+  }
+
+  void testReservedModes(const std::map<std::string, std::vector<uint8_t>> &vectors)
+  {
+    std::vector<uint8_t> wire = vectors.at("LORA_COMMAND_RECEIVE");
+    wire[10] = 0xA6;
+    wire.back() = protocol::xorChecksum(wire.data() + 3, wire.size() - 4);
+    protocol::DecodedPacket packet{};
+    protocol::DecodeError error = protocol::DecodeError::None;
+    assert(protocol::decodeApplicationFrame(
+        wire.data() + 3, wire.size() - 3, packet, error));
+    assert(packet.command_receive.fin_mode == 15);
+    assert(packet.command_receive.para_mode == 15);
+    assert(std::string(protocol::finModeName(packet.command_receive.fin_mode)) == "Unknown");
+    assert(std::string(protocol::paraModeName(packet.command_receive.para_mode)) == "Unknown");
+    assert(std::string(protocol::finModeName(5)) == "RollControl");
+    assert(std::string(protocol::paraModeName(5)) == "PoweredOff");
   }
 
   void testGoldenUplinks(const std::map<std::string, std::vector<uint8_t>> &vectors)
@@ -204,94 +292,172 @@ namespace
 
   void testScalarSemantics(const std::map<std::string, std::vector<uint8_t>> &vectors)
   {
-    assert(protocol::decodeRoll(raw16(vectors, "SCALAR_ROLL_NEG1")).count == -2);
-    assert(protocol::decodeRoll(raw16(vectors, "SCALAR_ROLL_MIN")).count == -32752);
-    assert(std::string(protocol::decodeRoll(
-                           raw16(vectors, "SCALAR_ROLL_RESET_INVALIDATED"))
-                           .status) == "RESET_INVALIDATED");
+    assertNumeric(protocol::decodeRoll(0x0000), 0);
+    assertNumeric(protocol::decodeRoll(0x7FFF), 32767);
+    assertNumeric(protocol::decodeRoll(raw16(vectors, "SCALAR_ROLL_NEG1")), -2);
+    assertNumeric(protocol::decodeRoll(raw16(vectors, "SCALAR_ROLL_MIN")), -32752);
+    assertStatus(protocol::decodeRoll(0x8000), "UNAVAILABLE");
+    assertStatus(protocol::decodeRoll(0x8004), "STALE_OR_NO_NEW_SAMPLE");
+    assertStatus(protocol::decodeRoll(
+                     raw16(vectors, "SCALAR_ROLL_RESET_INVALIDATED")),
+                 "RESET_INVALIDATED");
+    assertStatus(protocol::decodeRoll(0x800F), "UNKNOWN");
+    assertNumeric(protocol::decodeRollRate(0x7FFF), 32767);
+    assertNumeric(protocol::decodeRollRate(0x8010), -32752);
+    assertStatus(protocol::decodeRollRate(0x8000), "UNAVAILABLE");
+    assertStatus(protocol::decodeRollRate(0x8004), "STALE_OR_NO_NEW_SAMPLE");
+    assertStatus(protocol::decodeRollRate(0x800D), "RESET_INVALIDATED");
 
     const uint16_t tilt = raw16(vectors, "SCALAR_TILT_MAX");
-    assert(protocol::decodeTiltMagnitude(static_cast<uint8_t>(tilt & 0x7F)).count == 120);
-    assert(protocol::decodeTiltDirection(tilt >> 7).count == 359);
-    assert(std::string(protocol::decodeTiltDirection(360).status) == "RESERVED");
-    assert(std::string(protocol::decodeTiltDirection(512).status) == "INVALID_RAW");
+    assertNumeric(protocol::decodeTiltMagnitude(0), 0);
+    assertNumeric(protocol::decodeTiltMagnitude(static_cast<uint8_t>(tilt & 0x7F)), 120);
+    assertStatus(protocol::decodeTiltMagnitude(121), "UNAVAILABLE");
+    assertStatus(protocol::decodeTiltMagnitude(123), "STALE");
+    assertStatus(protocol::decodeTiltMagnitude(125), "RESET_INVALIDATED");
+    assertStatus(protocol::decodeTiltMagnitude(127), "UNKNOWN");
+    assertNumeric(protocol::decodeTiltDirection(0), 0);
+    assertNumeric(protocol::decodeTiltDirection(tilt >> 7), 359);
+    assertStatus(protocol::decodeTiltDirection(360), "RESERVED");
+    assertStatus(protocol::decodeTiltDirection(511), "RESERVED");
+    assertStatus(protocol::decodeTiltDirection(512), "INVALID_RAW");
     assert((tilt >> 7) == 359);
-    assert(protocol::decodeTiltMagnitude(128).numeric == false);
-    assert(std::string(protocol::decodeTiltMagnitude(128).status) == "INVALID_RAW");
+    assertStatus(protocol::decodeTiltMagnitude(128), "INVALID_RAW");
 
-    assert(protocol::decodeFinAngle(raw8(vectors, "SCALAR_FIN_ANGLE_MIN")).count == 0);
-    assert(protocol::decodeFinAngle(raw8(vectors, "SCALAR_FIN_ANGLE_ZERO")).count == 120);
-    assert(protocol::decodeFinAngle(raw8(vectors, "SCALAR_FIN_ANGLE_MAX")).count == 240);
-    assert(protocol::decodeFinRate(raw16(vectors, "SCALAR_FIN_RATE_NEG1")).count == -50);
-    assert(protocol::decodeRequestedTorque(
-               raw16(vectors, "SCALAR_TORQUE_NEG_0P246"))
-               .count == -123);
-    assert(protocol::decodeRequestedTorque(0x1F85).numeric == false);
+    assertNumeric(protocol::decodeFinAngle(raw8(vectors, "SCALAR_FIN_ANGLE_MIN")), 0);
+    assertNumeric(protocol::decodeFinAngle(raw8(vectors, "SCALAR_FIN_ANGLE_ZERO")), 120);
+    assertNumeric(protocol::decodeFinAngle(raw8(vectors, "SCALAR_FIN_ANGLE_MAX")), 240);
+    assertStatus(protocol::decodeFinAngle(241), "NOT_INITIALIZED");
+    assertStatus(protocol::decodeFinAngle(249), "STALE");
+    assertStatus(protocol::decodeFinAngle(252), "RESET_INVALIDATED");
+    assertStatus(protocol::decodeFinAngle(255), "INTERNAL_OR_UNKNOWN");
+    assertNumeric(protocol::decodeFinRate(0x7FFF), 32767);
+    assertNumeric(protocol::decodeFinRate(0x8010), -32752);
+    assertNumeric(protocol::decodeFinRate(raw16(vectors, "SCALAR_FIN_RATE_NEG1")), -50);
+    assertStatus(protocol::decodeFinRate(0x8000), "UNAVAILABLE");
+    assertStatus(protocol::decodeFinRate(0x8002), "STALE");
+    assertStatus(protocol::decodeFinRate(0x8009), "RESET_INVALIDATED");
+    assertStatus(protocol::decodeFinRate(0x800F), "RESERVED");
+    assertNumeric(protocol::decodeRequestedTorque(0x000), 0);
+    assertNumeric(protocol::decodeRequestedTorque(0x7FF), 2047);
+    assertNumeric(protocol::decodeRequestedTorque(0x810), -2032);
+    assertNumeric(protocol::decodeRequestedTorque(
+                      raw16(vectors, "SCALAR_TORQUE_NEG_0P246")),
+                  -123);
+    assertStatus(protocol::decodeRequestedTorque(0x800), "UNAVAILABLE");
+    assertStatus(protocol::decodeRequestedTorque(0x803), "RESET_INVALIDATED");
+    assertStatus(protocol::decodeRequestedTorque(0x807), "RESERVED");
+    assertStatus(protocol::decodeRequestedTorque(0x1F85), "INVALID_RAW");
 
-    assert(protocol::decodePressure(
-               raw16(vectors, "SCALAR_LPS_PRESSURE_1013P2"))
-               .count == 1066);
-    assert(protocol::decodePressure(raw16(vectors, "SCALAR_LPS_PRESSURE_MAX")).count == 2031);
-    assert(std::string(protocol::decodePressure(
-                           raw16(vectors, "SCALAR_LPS_PRESSURE_STALE"))
-                           .status) == "STALE");
-    assert(protocol::decodePressure(0x0FFF).numeric == false);
-    assert(protocol::decodeTemperature(raw8(vectors, "SCALAR_LPS_TEMP_20")).count == 70);
+    assertNumeric(protocol::decodePressure(0), 0);
+    assertNumeric(protocol::decodePressure(
+                      raw16(vectors, "SCALAR_LPS_PRESSURE_1013P2")),
+                  1066);
+    assertNumeric(protocol::decodePressure(
+                      raw16(vectors, "SCALAR_LPS_PRESSURE_MAX")),
+                  2031);
+    assertStatus(protocol::decodePressure(2032), "NOT_INITIALIZED");
+    assertStatus(protocol::decodePressure(
+                     raw16(vectors, "SCALAR_LPS_PRESSURE_STALE")),
+                 "STALE");
+    assertStatus(protocol::decodePressure(2046), "UNKNOWN");
+    assertStatus(protocol::decodePressure(2047), "UNAVAILABLE");
+    assertStatus(protocol::decodePressure(0x0FFF), "INVALID_RAW");
+    assertNumeric(protocol::decodeTemperature(0), 0);
+    assertNumeric(protocol::decodeTemperature(
+                      raw8(vectors, "SCALAR_LPS_TEMP_20")),
+                  70);
+    assertNumeric(protocol::decodeTemperature(200), 200);
+    assertStatus(protocol::decodeTemperature(201), "RESERVED");
+    assertStatus(protocol::decodeTemperature(239), "RESERVED");
+    assertStatus(protocol::decodeTemperature(240), "NOT_INITIALIZED");
+    assertStatus(protocol::decodeTemperature(247), "STALE");
+    assertStatus(protocol::decodeTemperature(255), "UNAVAILABLE");
 
-    assert(protocol::decodeAirspeed(raw8(vectors, "SCALAR_AIRSPEED_245")).count == 245);
-    assert(std::string(protocol::decodeAirspeed(
-                           raw8(vectors, "SCALAR_AIRSPEED_NEGATIVE"))
-                           .status) == "BELOW_RANGE_OR_NEGATIVE_DIFFERENTIAL_PRESSURE");
-    assert(protocol::decodeGnssHeight(0xFFFF).numeric == false);
-    assert(std::string(protocol::decodeAirspeed(
-                           raw8(vectors, "SCALAR_AIRSPEED_STALE"))
-                           .status) == "SSC_STALE");
+    assertNumeric(protocol::decodeAirspeed(0), 0);
+    assertNumeric(protocol::decodeAirspeed(raw8(vectors, "SCALAR_AIRSPEED_245")), 245);
+    assertStatus(protocol::decodeAirspeed(
+                     raw8(vectors, "SCALAR_AIRSPEED_NEGATIVE")),
+                 "BELOW_RANGE_OR_NEGATIVE_DIFFERENTIAL_PRESSURE");
+    assertStatus(protocol::decodeAirspeed(249), "SSC_NOT_INITIALIZED");
+    assertStatus(protocol::decodeAirspeed(
+                     raw8(vectors, "SCALAR_AIRSPEED_STALE")),
+                 "SSC_STALE");
+    assertStatus(protocol::decodeAirspeed(255), "AIRDATA_INTERNAL_INVALID");
 
-    assert(protocol::decodeFlightElapsed(
-               raw8(vectors, "SCALAR_FLIGHT_ELAPSED_23P9"))
-               .count == 239);
-    assert(std::string(protocol::decodeFlightElapsed(
-                           raw8(vectors, "SCALAR_FLIGHT_ELAPSED_STALE"))
-                           .status) == "STALE");
+    assertNumeric(protocol::decodeFlightElapsed(0), 0);
+    assertNumeric(protocol::decodeFlightElapsed(
+                      raw8(vectors, "SCALAR_FLIGHT_ELAPSED_23P9")),
+                  239);
+    assertStatus(protocol::decodeFlightElapsed(240), "PRE_LIFTOFF");
+    assertStatus(protocol::decodeFlightElapsed(241), "UNAVAILABLE");
+    assertStatus(protocol::decodeFlightElapsed(
+                     raw8(vectors, "SCALAR_FLIGHT_ELAPSED_STALE")),
+                 "STALE");
+    assertStatus(protocol::decodeFlightElapsed(253), "POWER_ON_RESET_UNRECOVERABLE");
+    assertStatus(protocol::decodeFlightElapsed(255), "UNKNOWN");
 
-    assert(protocol::decodeGnssCoordinate(
-               raw16(vectors, "SCALAR_GNSS_EAST_NEG1"))
-               .count == -1);
-    assert(std::string(protocol::decodeGnssCoordinate(
-                           raw16(vectors, "SCALAR_GNSS_NO_FIX"))
-                           .status) == "NO_FIX");
-    assert(std::string(protocol::decodeGnssCoordinate(
-                           raw16(vectors, "SCALAR_GNSS_STALE"))
-                           .status) == "STALE");
+    assertNumeric(protocol::decodeGnssCoordinate(0), 0);
+    assertNumeric(protocol::decodeGnssCoordinate(0x7FFF), 32767);
+    assertNumeric(protocol::decodeGnssCoordinate(0x8010), -32752);
+    assertNumeric(protocol::decodeGnssCoordinate(
+                      raw16(vectors, "SCALAR_GNSS_EAST_NEG1")),
+                  -1);
+    assertStatus(protocol::decodeGnssCoordinate(0x8000), "UNAVAILABLE");
+    assertStatus(protocol::decodeGnssCoordinate(
+                     raw16(vectors, "SCALAR_GNSS_NO_FIX")),
+                 "NO_FIX");
+    assertStatus(protocol::decodeGnssCoordinate(
+                     raw16(vectors, "SCALAR_GNSS_STALE")),
+                 "STALE");
+    assertStatus(protocol::decodeGnssCoordinate(0x8009), "RESERVED");
 
-    assert(protocol::decodeGnssHeight(
-               raw16(vectors, "SCALAR_GNSS_HEIGHT_100"))
-               .count == 40);
-    assert(std::string(protocol::decodeGnssHeight(
-                           raw16(vectors, "SCALAR_GNSS_HEIGHT_NO_FIX"))
-                           .status) == "NO_FIX");
-    assert(std::string(protocol::decodeGnssHeight(
-                           raw16(vectors, "SCALAR_GNSS_HEIGHT_STALE"))
-                           .status) == "STALE");
+    assertNumeric(protocol::decodeGnssHeight(0), 0);
+    assertNumeric(protocol::decodeGnssHeight(
+                      raw16(vectors, "SCALAR_GNSS_HEIGHT_100")),
+                  40);
+    assertNumeric(protocol::decodeGnssHeight(495), 495);
+    assertStatus(protocol::decodeGnssHeight(496), "UNAVAILABLE");
+    assertStatus(protocol::decodeGnssHeight(
+                     raw16(vectors, "SCALAR_GNSS_HEIGHT_NO_FIX")),
+                 "NO_FIX");
+    assertStatus(protocol::decodeGnssHeight(
+                     raw16(vectors, "SCALAR_GNSS_HEIGHT_STALE")),
+                 "STALE");
+    assertStatus(protocol::decodeGnssHeight(504), "RESERVED");
+    assertStatus(protocol::decodeGnssHeight(0xFFFF), "INVALID_RAW");
 
-    assert(protocol::decodeParaAngle(raw8(vectors, "SCALAR_PARA_ANGLE_360")).count == 240);
-    assert(std::string(protocol::decodeParaAngle(
-                           raw8(vectors, "SCALAR_PARA_STALE"))
-                           .status) == "STALE");
-    assert(protocol::decodeLongElapsed(
-               raw16(vectors, "SCALAR_DESCENT_ELAPSED_MAX"))
-               .count == 0xFFEF);
-    assert(std::string(protocol::decodeLongElapsed(
-                           raw16(vectors, "SCALAR_DESCENT_ELAPSED_STALE"))
-                           .status) == "STALE");
+    assertNumeric(protocol::decodeParaAngle(0), 0);
+    assertNumeric(protocol::decodeParaAngle(
+                      raw8(vectors, "SCALAR_PARA_ANGLE_360")),
+                  240);
+    assertStatus(protocol::decodeParaAngle(241), "NOT_INITIALIZED");
+    assertStatus(protocol::decodeParaAngle(
+                     raw8(vectors, "SCALAR_PARA_STALE")),
+                 "STALE");
+    assertStatus(protocol::decodeParaAngle(252), "POSITION_INVALID");
+    assertStatus(protocol::decodeParaAngle(255), "UNAVAILABLE");
+    assertNumeric(protocol::decodeLongElapsed(0), 0);
+    assertNumeric(protocol::decodeLongElapsed(
+                      raw16(vectors, "SCALAR_DESCENT_ELAPSED_MAX")),
+                  0xFFEF);
+    assertStatus(protocol::decodeLongElapsed(0xFFF0), "PRE_LIFTOFF");
+    assertStatus(protocol::decodeLongElapsed(0xFFF1), "UNAVAILABLE");
+    assertStatus(protocol::decodeLongElapsed(
+                     raw16(vectors, "SCALAR_DESCENT_ELAPSED_STALE")),
+                 "STALE");
+    assertStatus(protocol::decodeLongElapsed(0xFFFD), "POWER_ON_RESET_UNRECOVERABLE");
 
-    assert(protocol::decodeBattery(raw8(vectors, "SCALAR_BATTERY_12V")).count == 240);
-    assert(std::string(protocol::decodeBattery(
-                           raw8(vectors, "SCALAR_BATTERY_FIRST_RESERVED"))
-                           .status) == "RESERVED");
-    assert(std::string(protocol::decodeBattery(
-                           raw8(vectors, "SCALAR_BATTERY_STALE"))
-                           .status) == "STALE");
+    assertNumeric(protocol::decodeBattery(0), 0);
+    assertNumeric(protocol::decodeBattery(raw8(vectors, "SCALAR_BATTERY_12V")), 240);
+    assertStatus(protocol::decodeBattery(
+                     raw8(vectors, "SCALAR_BATTERY_FIRST_RESERVED")),
+                 "RESERVED");
+    assertStatus(protocol::decodeBattery(252), "RESERVED");
+    assertStatus(protocol::decodeBattery(
+                     raw8(vectors, "SCALAR_BATTERY_STALE")),
+                 "STALE");
+    assertStatus(protocol::decodeBattery(254), "ADC_ERROR");
+    assertStatus(protocol::decodeBattery(255), "UNAVAILABLE");
   }
 
   void testTransactionTracker()
@@ -313,6 +479,11 @@ namespace
     const protocol::CommandResult completed{ids[0], 0x13, 1, 0, 0};
     assert(tracker.markResult(completed));
     assert(!tracker.isPending(ids[0]));
+    assert(!tracker.release(ids[0]));
+    assert(tracker.release(ids[1]));
+    assert(!tracker.isPending(ids[1]));
+    const protocol::CommandResult mismatched{ids[2], 0x14, 1, 0, 0};
+    assert(!tracker.markResult(mismatched));
   }
 } // 無名名前空間
 
@@ -320,6 +491,7 @@ int main()
 {
   const auto vectors = loadVectors();
   testGoldenPackets(vectors);
+  testReservedModes(vectors);
   testGoldenUplinks(vectors);
   testMalformedFrames(vectors);
   testScalarSemantics(vectors);
