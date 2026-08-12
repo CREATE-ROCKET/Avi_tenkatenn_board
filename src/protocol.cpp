@@ -363,6 +363,13 @@ namespace protocol
     return raw <= 127 ? error(names[raw - 121]) : error("INVALID_RAW");
   }
 
+  SemanticValue decodeTiltDirection(uint16_t raw)
+  {
+    if (raw > 0x01FF)
+      return error("INVALID_RAW");
+    return raw <= 359 ? numeric(raw) : error("RESERVED");
+  }
+
   SemanticValue decodeFinAngle(uint8_t raw)
   {
     static const char *const names[] = {

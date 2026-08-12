@@ -212,6 +212,9 @@ namespace
 
     const uint16_t tilt = raw16(vectors, "SCALAR_TILT_MAX");
     assert(protocol::decodeTiltMagnitude(static_cast<uint8_t>(tilt & 0x7F)).count == 120);
+    assert(protocol::decodeTiltDirection(tilt >> 7).count == 359);
+    assert(std::string(protocol::decodeTiltDirection(360).status) == "RESERVED");
+    assert(std::string(protocol::decodeTiltDirection(512).status) == "INVALID_RAW");
     assert((tilt >> 7) == 359);
     assert(protocol::decodeTiltMagnitude(128).numeric == false);
     assert(std::string(protocol::decodeTiltMagnitude(128).status) == "INVALID_RAW");

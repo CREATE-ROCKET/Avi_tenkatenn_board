@@ -195,6 +195,7 @@ namespace protocol
   SemanticValue decodeRoll(uint16_t raw);
   SemanticValue decodeRollRate(uint16_t raw);
   SemanticValue decodeTiltMagnitude(uint8_t raw);
+  SemanticValue decodeTiltDirection(uint16_t raw);
   SemanticValue decodeFinAngle(uint8_t raw);
   SemanticValue decodeFinRate(uint16_t raw);
   SemanticValue decodeRequestedTorque(uint16_t raw);

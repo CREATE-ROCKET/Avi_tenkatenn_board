@@ -286,7 +286,7 @@ namespace
     printSemantic("Roll", protocol::decodeRoll(value.roll), 0.5, 0.0, "deg");
     printSemantic("Roll rate", protocol::decodeRollRate(value.roll_rate), 0.1, 0.0, "deg/s");
     printSemantic("Tilt", protocol::decodeTiltMagnitude(value.tilt_magnitude), 0.75, 0.0, "deg");
-    Serial.printf("Tilt direction raw: %u\r\n", value.tilt_direction);
+    printSemantic("Tilt direction", protocol::decodeTiltDirection(value.tilt_direction), 1.0, 0.0, "deg");
     printSemantic("Fin angle", protocol::decodeFinAngle(value.fin_angle), 0.125, -15.0, "deg");
     printSemantic("Fin rate", protocol::decodeFinRate(value.fin_rate), 0.02, 0.0, "deg/s");
     printSemantic("LPS pressure", protocol::decodePressure(value.pressure), 0.2, 800.0, "hPa");
@@ -316,7 +316,7 @@ namespace
                     (value.status & (1UL << bit)) != 0 ? "YES" : "NO");
     }
     printSemantic("Tilt", protocol::decodeTiltMagnitude(value.tilt_magnitude), 0.75, 0.0, "deg");
-    Serial.printf("Tilt direction raw: %u\r\n", value.tilt_direction);
+    printSemantic("Tilt direction", protocol::decodeTiltDirection(value.tilt_direction), 1.0, 0.0, "deg");
     printSemantic("Fin angle", protocol::decodeFinAngle(value.fin_angle), 0.125, -15.0, "deg");
     printSemantic("Parachute angle", protocol::decodeParaAngle(value.para_angle), 1.5, 0.0, "deg");
     printSemantic("LPS pressure", protocol::decodePressure(value.pressure), 0.2, 800.0, "hPa");
@@ -330,6 +330,18 @@ namespace
   void printDescent(const protocol::DescentTelemetry &value)
   {
     Serial.printf("Descent status: 0x%04X\r\n", value.status);
+    static const char *const status_names[] = {
+        "LPS deployment", "Elapsed deployment", "Power cutoff",
+        "Com SD", "Mission-CAN", "Deployment shock", "STS overload",
+        "STS overcurrent", "STS overtemperature", "STS encoder fault",
+        "STS voltage fault"};
+    Serial.printf("  Parachute state: %u\r\n", (value.status >> 2U) & 0x03U);
+    for (uint8_t index = 0; index < 2; ++index)
+      Serial.printf("  %-19s: %s\r\n", status_names[index],
+                    (value.status & (1U << index)) != 0 ? "YES" : "NO");
+    for (uint8_t bit = 4; bit <= 12; ++bit)
+      Serial.printf("  %-19s: %s\r\n", status_names[bit - 2],
+                    (value.status & (1U << bit)) != 0 ? "YES" : "NO");
     printSemantic("LPS pressure", protocol::decodePressure(value.pressure), 0.2, 800.0, "hPa");
     printSemantic("LPS temperature", protocol::decodeTemperature(value.temperature), 1.0, -50.0, "degC");
     printSemantic("Parachute angle", protocol::decodeParaAngle(value.para_angle), 1.5, 0.0, "deg");
