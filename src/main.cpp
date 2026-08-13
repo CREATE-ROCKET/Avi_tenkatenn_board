@@ -6,6 +6,7 @@
 #include <cstring>
 #include <freertos/FreeRTOS.h>
 #include <freertos/queue.h>
+#include <freertos/semphr.h>
 #include <freertos/task.h>
 
 #include "config.h"
@@ -26,7 +27,6 @@ namespace
     LiftoffEmergency,
     ComBoardLocal,
     GroundTimeResponse,
-    Result,
     ReleaseTransaction,
   };
 
@@ -35,13 +35,52 @@ namespace
     CommandMessageKind kind;
     uint8_t command;
     std::array<uint8_t, 6> args;
-    protocol::CommandResult result;
   };
 
+  constexpr bool requiresUplinkWindow(CommandMessageKind kind)
+  {
+    return kind != CommandMessageKind::ActuatorEmergency &&
+           kind != CommandMessageKind::LiftoffEmergency;
+  }
+
+  static_assert(!requiresUplinkWindow(CommandMessageKind::ActuatorEmergency));
+  static_assert(!requiresUplinkWindow(CommandMessageKind::LiftoffEmergency));
+  static_assert(requiresUplinkWindow(CommandMessageKind::MissionGeneric));
+
   QueueHandle_t command_queue = nullptr;
+  SemaphoreHandle_t uplink_window_signal = nullptr;
+  SemaphoreHandle_t transaction_mutex = nullptr;
+  TaskHandle_t command_send_task_handle = nullptr;
   protocol::TransactionTracker transaction_tracker;
   char console_line[CONSOLE_LINE_SIZE] = {};
   std::size_t console_line_length = 0;
+  constexpr uint32_t ACTUATOR_EMERGENCY_NOTIFICATION = 1U << 0U;
+  constexpr uint32_t LIFTOFF_EMERGENCY_NOTIFICATION = 1U << 1U;
+
+  bool reserveTransaction(protocol::UplinkKind kind, uint8_t command,
+                          uint8_t &transaction_id)
+  {
+    xSemaphoreTake(transaction_mutex, portMAX_DELAY);
+    const bool reserved = transaction_tracker.reserve(kind, command, transaction_id);
+    xSemaphoreGive(transaction_mutex);
+    return reserved;
+  }
+
+  bool releaseTransaction(uint8_t transaction_id)
+  {
+    xSemaphoreTake(transaction_mutex, portMAX_DELAY);
+    const bool released = transaction_tracker.release(transaction_id);
+    xSemaphoreGive(transaction_mutex);
+    return released;
+  }
+
+  bool markTransactionResult(const protocol::CommandResult &result)
+  {
+    xSemaphoreTake(transaction_mutex, portMAX_DELAY);
+    const bool matched = transaction_tracker.markResult(result);
+    xSemaphoreGive(transaction_mutex);
+    return matched;
+  }
 
   bool waitAuxHigh(uint32_t timeout_ms)
   {
@@ -76,13 +115,30 @@ namespace
 
   bool enqueueCommand(const CommandMessage &message)
   {
-    if (command_queue == nullptr ||
-        xQueueSend(command_queue, &message, 0) != pdPASS)
+    if (command_queue == nullptr)
+    {
+      Serial.println("command queue full");
+      return false;
+    }
+    if (xQueueSend(command_queue, &message, 0) != pdPASS)
     {
       Serial.println("command queue full");
       return false;
     }
     return true;
+  }
+
+  bool notifyEmergency(CommandMessageKind kind)
+  {
+    if (command_send_task_handle == nullptr)
+    {
+      return false;
+    }
+    const uint32_t notification =
+        kind == CommandMessageKind::ActuatorEmergency
+            ? ACTUATOR_EMERGENCY_NOTIFICATION
+            : LIFTOFF_EMERGENCY_NOTIFICATION;
+    return xTaskNotify(command_send_task_handle, notification, eSetBits) == pdPASS;
   }
 
   void printUsage()
@@ -145,7 +201,10 @@ namespace
       message.kind = std::strcmp(operation, "ae") == 0
                          ? CommandMessageKind::ActuatorEmergency
                          : CommandMessageKind::LiftoffEmergency;
-      enqueueCommand(message);
+      if (!notifyEmergency(message.kind))
+      {
+        Serial.println("emergency notification failed");
+      }
       return;
     }
 
@@ -439,10 +498,11 @@ namespace
                     protocol::phaseName(result.phase),
                     protocol::reasonName(result.reason),
                     static_cast<unsigned long>(result.detail));
-      CommandMessage message{};
-      message.kind = CommandMessageKind::Result;
-      message.result = result;
-      enqueueCommand(message);
+      if (!markTransactionResult(result))
+      {
+        Serial.printf("unmatched CommandResult id=%u command=0x%02X\r\n",
+                      result.transaction_id, result.command);
+      }
       break;
     }
     case protocol::PacketHeader::GroundTimeRequest:
@@ -483,89 +543,147 @@ namespace
     return true;
   }
 
+  bool takeEmergencyNotification(CommandMessage &message)
+  {
+    uint32_t notification = 0;
+    if (xTaskNotifyWait(0, UINT32_MAX, &notification, 0) != pdTRUE)
+    {
+      return false;
+    }
+    if ((notification & ACTUATOR_EMERGENCY_NOTIFICATION) != 0)
+    {
+      message.kind = CommandMessageKind::ActuatorEmergency;
+      if ((notification & LIFTOFF_EMERGENCY_NOTIFICATION) != 0)
+      {
+        xTaskNotify(command_send_task_handle, LIFTOFF_EMERGENCY_NOTIFICATION,
+                    eSetBits);
+      }
+      return true;
+    }
+    message.kind = CommandMessageKind::LiftoffEmergency;
+    return true;
+  }
+
+  void sendCommandMessage(const CommandMessage &message)
+  {
+    protocol::UplinkFrame uplink{};
+    bool reserved = false;
+    uint8_t transaction_id = 0;
+    if (message.kind == CommandMessageKind::GroundTimeResponse)
+    {
+      transaction_id = message.command;
+      uplink = {protocol::UplinkKind::GroundTimeResponse,
+                transaction_id, 2, message.args};
+    }
+    else
+    {
+      protocol::UplinkKind kind = protocol::UplinkKind::MissionGeneric;
+      uint8_t tracked_command = message.command;
+      uint8_t wire_command = message.command;
+      switch (message.kind)
+      {
+      case CommandMessageKind::MissionGeneric:
+        kind = protocol::UplinkKind::MissionGeneric;
+        break;
+      case CommandMessageKind::ActuatorEmergency:
+        kind = protocol::UplinkKind::ActuatorEmergency;
+        tracked_command = COMMAND_RESULT_ACTUATOR_EMERGENCY;
+        wire_command = 0;
+        break;
+      case CommandMessageKind::LiftoffEmergency:
+        kind = protocol::UplinkKind::LiftoffDetectionEmergency;
+        tracked_command = COMMAND_RESULT_LIFTOFF_EMERGENCY;
+        wire_command = 0;
+        break;
+      case CommandMessageKind::ComBoardLocal:
+        kind = protocol::UplinkKind::ComBoardLocal;
+        break;
+      default:
+        return;
+      }
+      if (!reserveTransaction(kind, tracked_command, transaction_id))
+      {
+        Serial.println("no free transaction ID");
+        return;
+      }
+      reserved = true;
+      uplink = {kind, transaction_id, wire_command, message.args};
+    }
+
+    // downlink直後のComBoard受信窓へ送信を合わせ、half-duplex衝突を避ける。
+    // Emergencyもfreshな受信窓を有限時間待つが、窓が来なくても必ず送信を試みる。
+    if (requiresUplinkWindow(message.kind))
+    {
+      (void)xSemaphoreTake(uplink_window_signal, 0);
+      const uint32_t started_at = millis();
+      bool window_opened = false;
+      while (millis() - started_at < UPLINK_WINDOW_TIMEOUT_MS)
+      {
+        CommandMessage emergency{};
+        if (takeEmergencyNotification(emergency))
+        {
+          sendCommandMessage(emergency);
+          continue;
+        }
+        if (xSemaphoreTake(uplink_window_signal, pdMS_TO_TICKS(10)) == pdTRUE)
+        {
+          window_opened = true;
+          break;
+        }
+      }
+      if (!window_opened)
+      {
+        if (reserved)
+        {
+          releaseTransaction(transaction_id);
+        }
+        Serial.printf("uplink window timeout id=%u\r\n", transaction_id);
+        return;
+      }
+    }
+    else
+    {
+      (void)xSemaphoreTake(uplink_window_signal, 0);
+      (void)xSemaphoreTake(uplink_window_signal,
+                           pdMS_TO_TICKS(UPLINK_WINDOW_TIMEOUT_MS));
+    }
+    if (!writeUplink(uplink))
+    {
+      if (reserved)
+      {
+        releaseTransaction(transaction_id);
+      }
+      Serial.printf("uplink failed id=%u\r\n", transaction_id);
+      return;
+    }
+    Serial.printf("uplink sent kind=%u id=%u command=0x%02X\r\n",
+                  static_cast<uint8_t>(uplink.kind), transaction_id,
+                  uplink.command);
+  }
+
   void commandSendTask(void *)
   {
     for (;;)
     {
       CommandMessage message{};
-      if (xQueueReceive(command_queue, &message, portMAX_DELAY) != pdPASS)
+      if (takeEmergencyNotification(message))
       {
+        sendCommandMessage(message);
         continue;
       }
-      if (message.kind == CommandMessageKind::Result)
+      if (xQueueReceive(command_queue, &message, pdMS_TO_TICKS(10)) != pdPASS)
       {
-        if (!transaction_tracker.markResult(message.result))
-        {
-          Serial.printf("unmatched CommandResult id=%u command=0x%02X\r\n",
-                        message.result.transaction_id, message.result.command);
-        }
         continue;
       }
       if (message.kind == CommandMessageKind::ReleaseTransaction)
       {
         Serial.printf("transaction id=%u %s\r\n", message.command,
-                      transaction_tracker.release(message.command)
+                      releaseTransaction(message.command)
                           ? "released"
                           : "was not pending");
         continue;
       }
-
-      protocol::UplinkFrame uplink{};
-      bool reserved = false;
-      uint8_t transaction_id = 0;
-      if (message.kind == CommandMessageKind::GroundTimeResponse)
-      {
-        transaction_id = message.command;
-        uplink = {protocol::UplinkKind::GroundTimeResponse,
-                  transaction_id, 2, message.args};
-      }
-      else
-      {
-        protocol::UplinkKind kind = protocol::UplinkKind::MissionGeneric;
-        uint8_t tracked_command = message.command;
-        uint8_t wire_command = message.command;
-        switch (message.kind)
-        {
-        case CommandMessageKind::MissionGeneric:
-          kind = protocol::UplinkKind::MissionGeneric;
-          break;
-        case CommandMessageKind::ActuatorEmergency:
-          kind = protocol::UplinkKind::ActuatorEmergency;
-          tracked_command = COMMAND_RESULT_ACTUATOR_EMERGENCY;
-          wire_command = 0;
-          break;
-        case CommandMessageKind::LiftoffEmergency:
-          kind = protocol::UplinkKind::LiftoffDetectionEmergency;
-          tracked_command = COMMAND_RESULT_LIFTOFF_EMERGENCY;
-          wire_command = 0;
-          break;
-        case CommandMessageKind::ComBoardLocal:
-          kind = protocol::UplinkKind::ComBoardLocal;
-          break;
-        default:
-          break;
-        }
-        if (!transaction_tracker.reserve(kind, tracked_command, transaction_id))
-        {
-          Serial.println("no free transaction ID");
-          continue;
-        }
-        reserved = true;
-        uplink = {kind, transaction_id, wire_command, message.args};
-      }
-
-      if (!writeUplink(uplink))
-      {
-        if (reserved)
-        {
-          transaction_tracker.release(transaction_id);
-        }
-        Serial.printf("uplink failed id=%u\r\n", transaction_id);
-        continue;
-      }
-      Serial.printf("uplink sent kind=%u id=%u command=0x%02X\r\n",
-                    static_cast<uint8_t>(uplink.kind), transaction_id,
-                    uplink.command);
+      sendCommandMessage(message);
     }
   }
 
@@ -576,6 +694,7 @@ namespace
       ReceivedPacket packet{};
       if (receive_packet(packet, portMAX_DELAY))
       {
+        xSemaphoreGive(uplink_window_signal);
         printPacket(packet);
       }
     }
@@ -607,6 +726,70 @@ namespace
     Serial.println();
     Serial.println("LoRa setup finished. Restore Communication mode and upload again.");
   }
+
+  void readLoraSettings()
+  {
+    digitalWrite(m0, HIGH);
+    digitalWrite(m1, HIGH);
+    delay(100);
+
+    bool received = false;
+    if (!waitAuxHigh(AUX_TIMEOUT_MS))
+    {
+      Serial.println("LoRa readback: AUX timeout before command");
+    }
+    else
+    {
+      while (Serial1.available() > 0)
+      {
+        Serial1.read();
+      }
+
+      // 設定を書き換えず、レジスタ読出しコマンドだけを送る。
+      Serial1.write(readCmd, sizeof(readCmd));
+      Serial1.flush();
+      if (!waitAuxHigh(AUX_TIMEOUT_MS))
+      {
+        Serial.println("LoRa readback: AUX timeout after command");
+      }
+
+      Serial.print("LoRa readback raw:");
+      const uint32_t started_at = millis();
+      uint32_t last_received_at = started_at;
+      while (millis() - started_at < 2000)
+      {
+        while (Serial1.available() > 0)
+        {
+          const uint8_t value = static_cast<uint8_t>(Serial1.read());
+          Serial.printf(" %02X", value);
+          received = true;
+          last_received_at = millis();
+        }
+        if (received && millis() - last_received_at >= 20)
+        {
+          break;
+        }
+        delay(1);
+      }
+      Serial.println();
+      if (!received)
+      {
+        Serial.println("LoRa readback: no response");
+      }
+    }
+
+    // 診断の成否にかかわらず通常通信状態へ戻す。
+    digitalWrite(m0, LOW);
+    digitalWrite(m1, LOW);
+    delay(100);
+    if (!waitAuxHigh(AUX_TIMEOUT_MS))
+    {
+      Serial.println("LoRa readback: AUX timeout while restoring communication mode");
+    }
+    Serial1.end();
+    Serial1.begin(115200, SERIAL_8N1, LoRA_RX, LoRA_TX);
+    Serial.println("LoRa readback finished; communication mode restored");
+  }
 } // 無名名前空間
 
 void setup()
@@ -620,10 +803,17 @@ void setup()
   pinMode(control_led, OUTPUT);
   pinMode(update_led, OUTPUT);
 
-  if (BOOT_MODE == BootMode::LoRaSetup)
+  if (BOOT_MODE == BootMode::LoRaSetup || BOOT_MODE == BootMode::LoRaReadback)
   {
     Serial1.begin(9600, SERIAL_8N1, LoRA_RX, LoRA_TX);
-    setupLoraSettings();
+    if (BOOT_MODE == BootMode::LoRaSetup)
+    {
+      setupLoraSettings();
+    }
+    else
+    {
+      readLoraSettings();
+    }
     return;
   }
 
@@ -636,7 +826,10 @@ void setup()
   digitalWrite(update_led, LOW);
 
   command_queue = xQueueCreate(COMMAND_QUEUE_LENGTH, sizeof(CommandMessage));
-  if (command_queue == nullptr || !start_decode_task())
+  uplink_window_signal = xSemaphoreCreateBinary();
+  transaction_mutex = xSemaphoreCreateMutex();
+  if (command_queue == nullptr || uplink_window_signal == nullptr ||
+      transaction_mutex == nullptr || !start_decode_task())
   {
     Serial.println("task queue initialization failed");
     return;
@@ -644,7 +837,8 @@ void setup()
   if (xTaskCreateUniversal(
           printPacketTask, "print_packet_task", 6144, nullptr, 1, nullptr, 0) != pdPASS ||
       xTaskCreateUniversal(
-          commandSendTask, "command_send_task", 4096, nullptr, 2, nullptr, 0) != pdPASS)
+          commandSendTask, "command_send_task", 4096, nullptr, 2,
+          &command_send_task_handle, 0) != pdPASS)
   {
     Serial.println("task creation failed");
     return;
@@ -654,7 +848,7 @@ void setup()
 
 void loop()
 {
-  if (BOOT_MODE == BootMode::LoRaSetup)
+  if (BOOT_MODE != BootMode::Communication)
   {
     delay(1000);
     return;

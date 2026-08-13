@@ -464,14 +464,23 @@ namespace
   {
     protocol::TransactionTracker tracker;
     std::array<uint8_t, protocol::MAX_PENDING_TRANSACTIONS> ids{};
-    for (uint8_t &id : ids)
+    const std::size_t normal_capacity =
+        ids.size() - protocol::EMERGENCY_RESERVED_TRANSACTIONS;
+    for (std::size_t index = 0; index < normal_capacity; ++index)
     {
+      uint8_t &id = ids[index];
       assert(tracker.reserve(protocol::UplinkKind::MissionGeneric, 0x13, id));
       assert(id != 0);
       assert(tracker.isPending(id));
     }
     uint8_t extra = 0;
     assert(!tracker.reserve(protocol::UplinkKind::MissionGeneric, 0x13, extra));
+    assert(tracker.reserve(protocol::UplinkKind::ActuatorEmergency, 0xF0,
+                           ids[normal_capacity]));
+    assert(tracker.reserve(protocol::UplinkKind::LiftoffDetectionEmergency,
+                           0xF1, ids[normal_capacity + 1]));
+    assert(!tracker.reserve(protocol::UplinkKind::ActuatorEmergency, 0xF0,
+                            extra));
 
     const protocol::CommandResult accepted{ids[0], 0x13, 0, 0, 0};
     assert(tracker.markResult(accepted));

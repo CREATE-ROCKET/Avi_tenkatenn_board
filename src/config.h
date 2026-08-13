@@ -5,7 +5,8 @@
 enum class BootMode
 {
   Communication,
-  LoRaSetup
+  LoRaSetup,
+  LoRaReadback
 };
 
 constexpr BootMode BOOT_MODE = BootMode::Communication;
@@ -17,6 +18,7 @@ constexpr uint8_t update_led = 14;
 constexpr uint32_t TELEMETRY_TIMEOUT_MS = 5000;
 constexpr uint32_t AUX_TIMEOUT_MS = 2000;
 constexpr uint32_t AUX_POLL_INTERVAL_MS = 1;
+constexpr uint32_t UPLINK_WINDOW_TIMEOUT_MS = 2000;
 
 constexpr uint8_t aux = 27;
 constexpr uint8_t LoRA_RX = 26;

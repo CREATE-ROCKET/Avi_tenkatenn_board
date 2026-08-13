@@ -9,6 +9,7 @@ namespace protocol
   constexpr std::size_t MAX_APPLICATION_FRAME_SIZE = 24;
   constexpr std::size_t UPLINK_FRAME_SIZE = 11;
   constexpr std::size_t MAX_PENDING_TRANSACTIONS = 16;
+  constexpr std::size_t EMERGENCY_RESERVED_TRANSACTIONS = 2;
 
   enum class PacketHeader : uint8_t
   {

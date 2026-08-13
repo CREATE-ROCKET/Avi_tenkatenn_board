@@ -558,12 +558,21 @@ namespace protocol
   bool TransactionTracker::reserve(UplinkKind kind, uint8_t command, uint8_t &transaction_id)
   {
     Entry *free_entry = nullptr;
+    std::size_t used = 0;
     for (Entry &entry : entries_)
     {
+      used += entry.used ? 1U : 0U;
       if (!entry.used && free_entry == nullptr)
       {
         free_entry = &entry;
       }
+    }
+    const bool emergency = kind == UplinkKind::ActuatorEmergency ||
+                           kind == UplinkKind::LiftoffDetectionEmergency;
+    if (!emergency &&
+        used >= MAX_PENDING_TRANSACTIONS - EMERGENCY_RESERVED_TRANSACTIONS)
+    {
+      return false;
     }
     if (free_entry == nullptr)
     {
