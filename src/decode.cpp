@@ -3,14 +3,67 @@
 #include <Arduino.h>
 #include <atomic>
 
+#include "uplink_boundary_policy.h"
+
 namespace
 {
   constexpr UBaseType_t PACKET_QUEUE_LENGTH = 16;
   QueueHandle_t packet_queue = nullptr;
+  QueueHandle_t uplink_boundary_queue = nullptr;
   uint32_t packet_sequence = 0;
+  uint32_t uplink_boundary_sequence = 0;
+  uint8_t consecutive_periodic = 0;
   uint32_t last_packet_at = 0;
   bool packet_is_active = false;
   std::atomic<uint32_t> packet_drop_count{0};
+
+  bool is_periodic_header(protocol::PacketHeader header)
+  {
+    const uint8_t value = static_cast<uint8_t>(header);
+    return value >= static_cast<uint8_t>(protocol::PacketHeader::CommandReceive) &&
+           value <= static_cast<uint8_t>(protocol::PacketHeader::Descent);
+  }
+
+  void publish_uplink_boundary(const protocol::DecodedPacket &packet,
+                               uint32_t received_at_us)
+  {
+    UplinkBoundary boundary{};
+    if (packet.header == protocol::PacketHeader::GroundTimeRequest)
+    {
+      boundary.kind = UplinkBoundaryKind::GroundTimeRequest;
+      boundary.request_id = packet.time_request.request_id;
+      consecutive_periodic = uplink_boundary_policy::resetPeriodicStreak();
+    }
+    else if (is_periodic_header(packet.header))
+    {
+      consecutive_periodic =
+          uplink_boundary_policy::advancePeriodicStreak(consecutive_periodic);
+      if (!uplink_boundary_policy::periodicModeActive(
+              consecutive_periodic, UPLINK_PERIODIC_ACTIVATION_COUNT))
+      {
+        return;
+      }
+      boundary.kind = UplinkBoundaryKind::Periodic;
+    }
+    else
+    {
+      // A5 Recovery、A6、B0はuplink開始境界には使用しない。
+      return;
+    }
+    ++uplink_boundary_sequence;
+    if (uplink_boundary_sequence == 0)
+    {
+      ++uplink_boundary_sequence;
+    }
+    boundary.header = static_cast<uint8_t>(packet.header);
+    boundary.sequence = uplink_boundary_sequence;
+    boundary.received_at_us = received_at_us;
+    if (uplink_boundary_queue != nullptr)
+    {
+      // 未使用の古い境界はlatestへ置換し、backlogを作らない。
+      xQueueOverwrite(uplink_boundary_queue, &boundary);
+    }
+  }
 
   void publish_packet(
       const protocol::DecodedPacket &packet,
@@ -18,16 +71,19 @@ namespace
       bool has_rssi)
   {
     const uint32_t received_at = millis();
+    const uint32_t received_at_us = micros();
     const bool has_interval = packet_sequence > 0;
     const ReceivedPacket received{
         packet,
         rssi,
         has_rssi,
         received_at,
+        received_at_us,
         has_interval ? received_at - last_packet_at : 0,
         has_interval};
     last_packet_at = received_at;
     ++packet_sequence;
+    publish_uplink_boundary(packet, received_at_us);
 
     if (packet_queue == nullptr ||
         xQueueSend(packet_queue, &received, 0) != pdPASS)
@@ -150,6 +206,13 @@ namespace
           millis() - last_packet_at >= TELEMETRY_TIMEOUT_MS)
       {
         packet_is_active = false;
+        if (uplink_boundary_queue != nullptr)
+        {
+          // 受信断中のschedule変更を推測せず、startup同様fail-closedへ戻す。
+          xQueueReset(uplink_boundary_queue);
+          consecutive_periodic =
+              uplink_boundary_policy::resetPeriodicStreak();
+        }
         digitalWrite(update_led, LOW);
       }
 
@@ -161,13 +224,21 @@ namespace
 bool start_decode_task()
 {
   packet_queue = xQueueCreate(PACKET_QUEUE_LENGTH, sizeof(ReceivedPacket));
-  if (packet_queue == nullptr)
+  uplink_boundary_queue = xQueueCreate(1, sizeof(UplinkBoundary));
+  consecutive_periodic = uplink_boundary_policy::resetPeriodicStreak();
+  if (packet_queue == nullptr || uplink_boundary_queue == nullptr)
   {
     Serial.println("failed to create packet queue");
     return false;
   }
   return xTaskCreateUniversal(
              decode_task, "decode_task", 4096, nullptr, 3, nullptr, 0) == pdPASS;
+}
+
+bool receive_uplink_boundary(UplinkBoundary &destination, TickType_t timeout)
+{
+  return uplink_boundary_queue != nullptr &&
+         xQueueReceive(uplink_boundary_queue, &destination, timeout) == pdPASS;
 }
 
 bool receive_packet(ReceivedPacket &destination, TickType_t timeout)

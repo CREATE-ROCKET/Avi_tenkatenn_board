@@ -12,10 +12,16 @@
 #include "config.h"
 #include "decode.h"
 #include "protocol.h"
+#include "uplink_boundary_policy.h"
+
+#ifndef GROUND_LORA_TIMING_DEBUG
+#define GROUND_LORA_TIMING_DEBUG 0
+#endif
 
 namespace
 {
   constexpr UBaseType_t COMMAND_QUEUE_LENGTH = 16;
+  constexpr UBaseType_t EMERGENCY_COMMAND_QUEUE_LENGTH = 2;
   constexpr std::size_t CONSOLE_LINE_SIZE = 128;
   constexpr uint8_t COMMAND_RESULT_ACTUATOR_EMERGENCY = 0xF0;
   constexpr uint8_t COMMAND_RESULT_LIFTOFF_EMERGENCY = 0xF1;
@@ -35,27 +41,72 @@ namespace
     CommandMessageKind kind;
     uint8_t command;
     std::array<uint8_t, 6> args;
+    uint32_t requested_at_us;
+    uint32_t dequeued_at_us;
   };
 
-  constexpr bool requiresUplinkWindow(CommandMessageKind kind)
+  struct UplinkTiming
   {
-    return kind != CommandMessageKind::ActuatorEmergency &&
-           kind != CommandMessageKind::LiftoffEmergency;
-  }
-
-  static_assert(!requiresUplinkWindow(CommandMessageKind::ActuatorEmergency));
-  static_assert(!requiresUplinkWindow(CommandMessageKind::LiftoffEmergency));
-  static_assert(requiresUplinkWindow(CommandMessageKind::MissionGeneric));
+    uint32_t requested_at_us = 0;
+    uint32_t dequeued_at_us = 0;
+    uint32_t aux_ready_at_us = 0;
+    uint32_t write_started_at_us = 0;
+    uint32_t write_finished_at_us = 0;
+    uint32_t flush_finished_at_us = 0;
+    uint32_t aux_low_at_us = 0;
+    uint32_t aux_high_at_us = 0;
+    uint32_t completed_at_us = 0;
+    uint32_t boundary_sequence = 0;
+    uint32_t boundary_received_at_us = 0;
+    uint32_t boundary_age_us = 0;
+    uint32_t boundary_wait_us = 0;
+    uint8_t boundary_header = 0;
+    UplinkBoundaryKind boundary_kind = UplinkBoundaryKind::Periodic;
+    bool boundary_observed = false;
+    bool boundary_fallback = false;
+    bool aux_low_observed = false;
+  };
 
   QueueHandle_t command_queue = nullptr;
-  SemaphoreHandle_t uplink_window_signal = nullptr;
+  QueueHandle_t emergency_command_queue = nullptr;
   SemaphoreHandle_t transaction_mutex = nullptr;
-  TaskHandle_t command_send_task_handle = nullptr;
   protocol::TransactionTracker transaction_tracker;
   char console_line[CONSOLE_LINE_SIZE] = {};
   std::size_t console_line_length = 0;
-  constexpr uint32_t ACTUATOR_EMERGENCY_NOTIFICATION = 1U << 0U;
-  constexpr uint32_t LIFTOFF_EMERGENCY_NOTIFICATION = 1U << 1U;
+
+  enum class TxOpportunity : uint8_t
+  {
+    Ready,
+    EmergencyPending,
+    Timeout,
+  };
+
+  bool takeEmergencyCommand(CommandMessage &message);
+
+  const char *boundaryKindName(UplinkBoundaryKind kind)
+  {
+    return kind == UplinkBoundaryKind::Periodic ? "periodic" : "time_request";
+  }
+
+  const char *commandKindName(CommandMessageKind kind)
+  {
+    switch (kind)
+    {
+    case CommandMessageKind::MissionGeneric:
+      return "mission_generic";
+    case CommandMessageKind::ActuatorEmergency:
+      return "actuator_emergency";
+    case CommandMessageKind::LiftoffEmergency:
+      return "liftoff_emergency";
+    case CommandMessageKind::ComBoardLocal:
+      return "comboard_local";
+    case CommandMessageKind::GroundTimeResponse:
+      return "ground_time_response";
+    case CommandMessageKind::ReleaseTransaction:
+      return "release_transaction";
+    }
+    return "unknown";
+  }
 
   bool reserveTransaction(protocol::UplinkKind kind, uint8_t command,
                           uint8_t &transaction_id)
@@ -96,6 +147,98 @@ namespace
     return true;
   }
 
+  TxOpportunity waitForNormalTxOpportunity(CommandMessage &emergency)
+  {
+    const uint32_t started_at = millis();
+    while (true)
+    {
+      // AUX待機中もEmergency queueを確認し、選択済み通常commandより先に送る。
+      if (takeEmergencyCommand(emergency))
+      {
+        return TxOpportunity::EmergencyPending;
+      }
+      if (digitalRead(aux) == HIGH)
+      {
+        // High判定直後に届いたEmergencyも先に処理する。
+        if (takeEmergencyCommand(emergency))
+        {
+          return TxOpportunity::EmergencyPending;
+        }
+        return TxOpportunity::Ready;
+      }
+      if (millis() - started_at >= AUX_TIMEOUT_MS)
+      {
+        return TxOpportunity::Timeout;
+      }
+      vTaskDelay(pdMS_TO_TICKS(AUX_POLL_INTERVAL_MS));
+    }
+  }
+
+  bool receiveBoundaryForMessage(const CommandMessage &message,
+                                 UplinkBoundary &boundary,
+                                 TickType_t timeout)
+  {
+    if (!receive_uplink_boundary(boundary, timeout))
+    {
+      return false;
+    }
+    // 時刻応答だけはB1完了を必須とし、他commandは単一queueの境界を共有する。
+    return message.kind != CommandMessageKind::GroundTimeResponse ||
+           boundary.kind == UplinkBoundaryKind::GroundTimeRequest;
+  }
+
+  TxOpportunity waitForUplinkBoundary(const CommandMessage &message,
+                                      CommandMessage &emergency,
+                                      UplinkBoundary &boundary,
+                                      UplinkTiming &timing,
+                                      uint32_t overall_started_at_ms,
+                                      uint32_t overall_started_at_us)
+  {
+    const bool current_is_emergency =
+        message.kind == CommandMessageKind::ActuatorEmergency ||
+        message.kind == CommandMessageKind::LiftoffEmergency;
+    while (true)
+    {
+      if (uplink_boundary_policy::deadlineExpiredMs(
+              millis(), overall_started_at_ms,
+              UPLINK_BOUNDARY_TIMEOUT_MS))
+      {
+        timing.boundary_wait_us = micros() - overall_started_at_us;
+        return TxOpportunity::Timeout;
+      }
+      if (!current_is_emergency && takeEmergencyCommand(emergency))
+      {
+        return TxOpportunity::EmergencyPending;
+      }
+
+      if (receiveBoundaryForMessage(message, boundary, pdMS_TO_TICKS(1)))
+      {
+        const uint32_t accepted_at_us = micros();
+        const uint32_t age_us = uplink_boundary_policy::elapsedUs(
+            accepted_at_us, boundary.received_at_us);
+        if (!uplink_boundary_policy::isFresh(
+                accepted_at_us, boundary.received_at_us,
+                UPLINK_BOUNDARY_FRESH_US))
+        {
+          continue;
+        }
+        if (!current_is_emergency && takeEmergencyCommand(emergency))
+        {
+          // 競合なく一境界一送信を守るため、取得済み境界は再投入しない。
+          return TxOpportunity::EmergencyPending;
+        }
+        timing.boundary_observed = true;
+        timing.boundary_kind = boundary.kind;
+        timing.boundary_header = boundary.header;
+        timing.boundary_sequence = boundary.sequence;
+        timing.boundary_received_at_us = boundary.received_at_us;
+        timing.boundary_age_us = age_us;
+        timing.boundary_wait_us = accepted_at_us - overall_started_at_us;
+        return TxOpportunity::Ready;
+      }
+    }
+  }
+
   bool parseUnsigned(const char *text, uint32_t maximum, uint32_t &value)
   {
     if (text == nullptr || *text == '\0' || *text == '-')
@@ -128,17 +271,17 @@ namespace
     return true;
   }
 
-  bool notifyEmergency(CommandMessageKind kind)
+  bool notifyEmergency(CommandMessageKind kind, uint32_t requested_at_us)
   {
-    if (command_send_task_handle == nullptr)
+    if (emergency_command_queue == nullptr)
     {
       return false;
     }
-    const uint32_t notification =
-        kind == CommandMessageKind::ActuatorEmergency
-            ? ACTUATOR_EMERGENCY_NOTIFICATION
-            : LIFTOFF_EMERGENCY_NOTIFICATION;
-    return xTaskNotify(command_send_task_handle, notification, eSetBits) == pdPASS;
+    CommandMessage message{};
+    message.kind = kind;
+    message.requested_at_us = requested_at_us;
+    // 同種Emergencyも別entryとして保持し、満杯なら呼出側へ明示的に失敗を返す。
+    return xQueueSend(emergency_command_queue, &message, 0) == pdPASS;
   }
 
   void printUsage()
@@ -191,6 +334,7 @@ namespace
     }
 
     CommandMessage message{};
+    message.requested_at_us = micros();
     if (std::strcmp(operation, "ae") == 0 || std::strcmp(operation, "le") == 0)
     {
       if (strtok_r(nullptr, " \t", &save) != nullptr)
@@ -201,7 +345,7 @@ namespace
       message.kind = std::strcmp(operation, "ae") == 0
                          ? CommandMessageKind::ActuatorEmergency
                          : CommandMessageKind::LiftoffEmergency;
-      if (!notifyEmergency(message.kind))
+      if (!notifyEmergency(message.kind, message.requested_at_us))
       {
         Serial.println("emergency notification failed");
       }
@@ -493,6 +637,11 @@ namespace
     case protocol::PacketHeader::CommandResult:
     {
       const auto &result = packet.command_result;
+#if GROUND_LORA_TIMING_DEBUG
+      Serial.printf("GROUND_LORA_TIMING event=result_received transaction_id=%u command=0x%02X received_at_us=%lu\r\n",
+                    result.transaction_id, result.command,
+                    static_cast<unsigned long>(received.received_at_us));
+#endif
       Serial.printf("CommandResult id=%u command=0x%02X phase=%s reason=%s detail=0x%08lX\r\n",
                     result.transaction_id, result.command,
                     protocol::phaseName(result.phase),
@@ -519,53 +668,80 @@ namespace
     }
   }
 
-  bool writeUplink(const protocol::UplinkFrame &uplink)
+  bool writeUplink(const protocol::UplinkFrame &uplink,
+                   const std::array<uint8_t, protocol::UPLINK_FRAME_SIZE> &application,
+                   const char *source,
+                   UplinkTiming &timing)
   {
-    std::array<uint8_t, protocol::UPLINK_FRAME_SIZE> application{};
-    if (!protocol::encodeUplink(uplink, application))
-    {
-      return false;
-    }
-    if (!waitAuxHigh(AUX_TIMEOUT_MS))
-    {
-      Serial.println("AUX timeout before uplink");
-      return false;
-    }
+    // 呼出側がframeをencodeし、送信直前のAUX Highを確認済みであること。
     const uint8_t prefix[] = {ADD_H, ADD_L, CHNNL};
+    timing.write_started_at_us = micros();
     Serial1.write(prefix, sizeof(prefix));
     Serial1.write(application.data(), application.size());
+    timing.write_finished_at_us = micros();
+    if (digitalRead(aux) == LOW)
+    {
+      timing.aux_low_observed = true;
+      timing.aux_low_at_us = micros();
+    }
     Serial1.flush();
+    timing.flush_finished_at_us = micros();
+    if (!timing.aux_low_observed && digitalRead(aux) == LOW)
+    {
+      timing.aux_low_observed = true;
+      timing.aux_low_at_us = micros();
+    }
     if (!waitAuxHigh(AUX_TIMEOUT_MS))
     {
       Serial.println("AUX timeout after uplink");
       return false;
     }
+    timing.aux_high_at_us = micros();
+    timing.completed_at_us = timing.aux_high_at_us;
+#if GROUND_LORA_TIMING_DEBUG
+    Serial.printf("GROUND_LORA_TIMING source=%s transaction_id=%u requested_at_us=%lu dequeued_at_us=%lu boundary_kind=%s boundary_header=0x%02X boundary_sequence=%lu boundary_received_at_us=%lu boundary_age_us=%lu boundary_wait_us=%lu boundary_fallback=%u aux_ready_at_us=%lu write_started_at_us=%lu write_finished_at_us=%lu flush_finished_at_us=%lu aux_low_observed=%u aux_low_at_us=%lu aux_high_at_us=%lu completed_at_us=%lu\r\n",
+                  source, uplink.transaction_id,
+                  static_cast<unsigned long>(timing.requested_at_us),
+                  static_cast<unsigned long>(timing.dequeued_at_us),
+                  timing.boundary_observed
+                      ? boundaryKindName(timing.boundary_kind)
+                      : "none",
+                  timing.boundary_header,
+                  static_cast<unsigned long>(timing.boundary_sequence),
+                  static_cast<unsigned long>(timing.boundary_received_at_us),
+                  static_cast<unsigned long>(timing.boundary_age_us),
+                  static_cast<unsigned long>(timing.boundary_wait_us),
+                  timing.boundary_fallback ? 1U : 0U,
+                  static_cast<unsigned long>(timing.aux_ready_at_us),
+                  static_cast<unsigned long>(timing.write_started_at_us),
+                  static_cast<unsigned long>(timing.write_finished_at_us),
+                  static_cast<unsigned long>(timing.flush_finished_at_us),
+                  timing.aux_low_observed ? 1U : 0U,
+                  static_cast<unsigned long>(timing.aux_low_at_us),
+                  static_cast<unsigned long>(timing.aux_high_at_us),
+                  static_cast<unsigned long>(timing.completed_at_us));
+#else
+    (void)source;
+#endif
     return true;
   }
 
-  bool takeEmergencyNotification(CommandMessage &message)
+  bool takeEmergencyCommand(CommandMessage &message)
   {
-    uint32_t notification = 0;
-    if (xTaskNotifyWait(0, UINT32_MAX, &notification, 0) != pdTRUE)
+    if (emergency_command_queue == nullptr ||
+        xQueueReceive(emergency_command_queue, &message, 0) != pdPASS)
     {
       return false;
     }
-    if ((notification & ACTUATOR_EMERGENCY_NOTIFICATION) != 0)
-    {
-      message.kind = CommandMessageKind::ActuatorEmergency;
-      if ((notification & LIFTOFF_EMERGENCY_NOTIFICATION) != 0)
-      {
-        xTaskNotify(command_send_task_handle, LIFTOFF_EMERGENCY_NOTIFICATION,
-                    eSetBits);
-      }
-      return true;
-    }
-    message.kind = CommandMessageKind::LiftoffEmergency;
+    message.dequeued_at_us = micros();
     return true;
   }
 
   void sendCommandMessage(const CommandMessage &message)
   {
+    UplinkTiming timing{};
+    timing.requested_at_us = message.requested_at_us;
+    timing.dequeued_at_us = message.dequeued_at_us;
     protocol::UplinkFrame uplink{};
     bool reserved = false;
     uint8_t transaction_id = 0;
@@ -610,44 +786,187 @@ namespace
       uplink = {kind, transaction_id, wire_command, message.args};
     }
 
-    // downlink直後のComBoard受信窓へ送信を合わせ、half-duplex衝突を避ける。
-    // Emergencyもfreshな受信窓を有限時間待つが、窓が来なくても必ず送信を試みる。
-    if (requiresUplinkWindow(message.kind))
+    std::array<uint8_t, protocol::UPLINK_FRAME_SIZE> application{};
+    if (!protocol::encodeUplink(uplink, application))
     {
-      (void)xSemaphoreTake(uplink_window_signal, 0);
-      const uint32_t started_at = millis();
-      bool window_opened = false;
-      while (millis() - started_at < UPLINK_WINDOW_TIMEOUT_MS)
+      if (reserved)
       {
-        CommandMessage emergency{};
-        if (takeEmergencyNotification(emergency))
+        releaseTransaction(transaction_id);
+      }
+      Serial.printf("uplink failed id=%u\r\n", transaction_id);
+      return;
+    }
+
+    const bool emergency =
+        message.kind == CommandMessageKind::ActuatorEmergency ||
+        message.kind == CommandMessageKind::LiftoffEmergency;
+    const auto fail_before_uplink = [&](const char *reason) {
+      if (reserved)
+      {
+        releaseTransaction(transaction_id);
+      }
+      Serial.printf("%s before uplink\r\n", reason);
+      Serial.printf("uplink failed id=%u\r\n", transaction_id);
+    };
+
+    UplinkBoundary boundary{};
+    bool boundary_wait_started = false;
+    uint32_t boundary_wait_started_at_ms = 0;
+    uint32_t boundary_wait_started_at_us = 0;
+    const auto record_aux_ready = [&]() {
+      const uint32_t ready_at_ms = millis();
+      const uint32_t ready_at_us = micros();
+      timing.aux_ready_at_us = ready_at_us;
+      if (!boundary_wait_started)
+      {
+        // invalidated境界やEmergency preemptを跨いでもdeadlineをresetしない。
+        boundary_wait_started = true;
+        boundary_wait_started_at_ms = ready_at_ms;
+        boundary_wait_started_at_us = ready_at_us;
+      }
+    };
+    while (true)
+    {
+      timing.boundary_observed = false;
+      timing.boundary_fallback = false;
+      timing.boundary_header = 0;
+      timing.boundary_sequence = 0;
+      timing.boundary_received_at_us = 0;
+      timing.boundary_age_us = 0;
+      CommandMessage pending_emergency{};
+
+      // boundary受理後にblocking待機を残さないため、先にAUX readyを成立させる。
+      if (emergency)
+      {
+        if (!waitAuxHigh(AUX_TIMEOUT_MS))
         {
-          sendCommandMessage(emergency);
+          fail_before_uplink("AUX timeout");
+          return;
+        }
+        record_aux_ready();
+      }
+      else
+      {
+        const TxOpportunity aux_opportunity =
+            waitForNormalTxOpportunity(pending_emergency);
+        if (aux_opportunity == TxOpportunity::Timeout)
+        {
+#if GROUND_LORA_TIMING_DEBUG
+          Serial.printf("GROUND_LORA_TIMING event=pre_tx_timeout source=%s requested_at_us=%lu dequeued_at_us=%lu\r\n",
+                        commandKindName(message.kind),
+                        static_cast<unsigned long>(message.requested_at_us),
+                        static_cast<unsigned long>(message.dequeued_at_us));
+#endif
+          fail_before_uplink("AUX timeout");
+          return;
+        }
+        if (aux_opportunity == TxOpportunity::EmergencyPending)
+        {
+#if GROUND_LORA_TIMING_DEBUG
+          Serial.printf("GROUND_LORA_TIMING event=normal_preempted stage=aux_wait normal=%s emergency=%s requested_at_us=%lu\r\n",
+                        commandKindName(message.kind),
+                        commandKindName(pending_emergency.kind),
+                        static_cast<unsigned long>(pending_emergency.requested_at_us));
+#endif
+          sendCommandMessage(pending_emergency);
           continue;
         }
-        if (xSemaphoreTake(uplink_window_signal, pdMS_TO_TICKS(10)) == pdTRUE)
-        {
-          window_opened = true;
-          break;
-        }
+        record_aux_ready();
       }
-      if (!window_opened)
+
+      const TxOpportunity boundary_opportunity =
+          waitForUplinkBoundary(
+              message, pending_emergency, boundary, timing,
+              boundary_wait_started_at_ms, boundary_wait_started_at_us);
+      if (boundary_opportunity == TxOpportunity::EmergencyPending)
       {
-        if (reserved)
-        {
-          releaseTransaction(transaction_id);
-        }
-        Serial.printf("uplink window timeout id=%u\r\n", transaction_id);
-        return;
+#if GROUND_LORA_TIMING_DEBUG
+        Serial.printf("GROUND_LORA_TIMING event=normal_preempted stage=boundary_wait normal=%s emergency=%s requested_at_us=%lu\r\n",
+                      commandKindName(message.kind),
+                      commandKindName(pending_emergency.kind),
+                      static_cast<unsigned long>(pending_emergency.requested_at_us));
+#endif
+        sendCommandMessage(pending_emergency);
+        continue;
       }
+      if (boundary_opportunity == TxOpportunity::Timeout)
+      {
+        if (!emergency)
+        {
+#if GROUND_LORA_TIMING_DEBUG
+          Serial.printf("GROUND_LORA_TIMING event=boundary_timeout source=%s timeout_ms=%lu requested_at_us=%lu dequeued_at_us=%lu boundary_wait_us=%lu\r\n",
+                        commandKindName(message.kind),
+                        static_cast<unsigned long>(UPLINK_BOUNDARY_TIMEOUT_MS),
+                        static_cast<unsigned long>(message.requested_at_us),
+                        static_cast<unsigned long>(message.dequeued_at_us),
+                        static_cast<unsigned long>(timing.boundary_wait_us));
+#endif
+          fail_before_uplink("downlink boundary timeout");
+          return;
+        }
+        // 2200 ms安全境界を得られない場合はavailabilityを優先して直接送る。
+        // telemetry継続中でも、このfallbackはdownlinkと衝突し得る。
+        timing.boundary_fallback = true;
+#if GROUND_LORA_TIMING_DEBUG
+        Serial.printf("GROUND_LORA_TIMING event=emergency_boundary_fallback source=%s requested_at_us=%lu dequeued_at_us=%lu boundary_wait_us=%lu\r\n",
+                      commandKindName(message.kind),
+                      static_cast<unsigned long>(message.requested_at_us),
+                      static_cast<unsigned long>(message.dequeued_at_us),
+                      static_cast<unsigned long>(timing.boundary_wait_us));
+#endif
+        // timeout確定後はboundaryを再待機せず、AUX Highだけを有限待機する。
+        if (!waitAuxHigh(AUX_TIMEOUT_MS))
+        {
+          fail_before_uplink("AUX timeout");
+          return;
+        }
+        record_aux_ready();
+        break;
+      }
+
+      // boundary待機中にAUXがbusyへ戻った場合や、20 msの安全窓を外れた
+      // 場合はこの境界を破棄する。transactionは保持して次の境界を待つ。
+      if (boundary_opportunity == TxOpportunity::Ready)
+      {
+        const uint32_t commit_checked_at_us = micros();
+        timing.boundary_age_us = uplink_boundary_policy::elapsedUs(
+            commit_checked_at_us, boundary.received_at_us);
+        const bool aux_still_high = digitalRead(aux) == HIGH;
+        const bool boundary_still_fresh = uplink_boundary_policy::isFresh(
+            commit_checked_at_us, boundary.received_at_us,
+            UPLINK_BOUNDARY_FRESH_US);
+        if (!aux_still_high || !boundary_still_fresh)
+        {
+#if GROUND_LORA_TIMING_DEBUG
+          Serial.printf("GROUND_LORA_TIMING event=boundary_invalidated source=%s aux_high=%u boundary_age_us=%lu boundary_sequence=%lu\r\n",
+                        commandKindName(message.kind),
+                        aux_still_high ? 1U : 0U,
+                        static_cast<unsigned long>(timing.boundary_age_us),
+                        static_cast<unsigned long>(timing.boundary_sequence));
+#endif
+          continue;
+        }
+      }
+
+      // ここを通常UART TXのcommit pointとする。Queue受信とUART writeを
+      // 同期atomicにはせず、poll後のEmergencyは進行中TXをpreemptしない。
+      if (!emergency && takeEmergencyCommand(pending_emergency))
+      {
+#if GROUND_LORA_TIMING_DEBUG
+        Serial.printf("GROUND_LORA_TIMING event=normal_preempted stage=uart_commit normal=%s emergency=%s requested_at_us=%lu\r\n",
+                      commandKindName(message.kind),
+                      commandKindName(pending_emergency.kind),
+                      static_cast<unsigned long>(pending_emergency.requested_at_us));
+#endif
+        // 選択済み通常transactionは保持し、次の単一境界から再開する。
+        sendCommandMessage(pending_emergency);
+        continue;
+      }
+      break;
     }
-    else
-    {
-      (void)xSemaphoreTake(uplink_window_signal, 0);
-      (void)xSemaphoreTake(uplink_window_signal,
-                           pdMS_TO_TICKS(UPLINK_WINDOW_TIMEOUT_MS));
-    }
-    if (!writeUplink(uplink))
+
+    // commit point以降の一回のUART送信はnonpreemptibleとする。
+    if (!writeUplink(uplink, application, commandKindName(message.kind), timing))
     {
       if (reserved)
       {
@@ -666,7 +985,7 @@ namespace
     for (;;)
     {
       CommandMessage message{};
-      if (takeEmergencyNotification(message))
+      if (takeEmergencyCommand(message))
       {
         sendCommandMessage(message);
         continue;
@@ -675,6 +994,7 @@ namespace
       {
         continue;
       }
+      message.dequeued_at_us = micros();
       if (message.kind == CommandMessageKind::ReleaseTransaction)
       {
         Serial.printf("transaction id=%u %s\r\n", message.command,
@@ -683,6 +1003,7 @@ namespace
                           : "was not pending");
         continue;
       }
+
       sendCommandMessage(message);
     }
   }
@@ -694,7 +1015,6 @@ namespace
       ReceivedPacket packet{};
       if (receive_packet(packet, portMAX_DELAY))
       {
-        xSemaphoreGive(uplink_window_signal);
         printPacket(packet);
       }
     }
@@ -826,9 +1146,10 @@ void setup()
   digitalWrite(update_led, LOW);
 
   command_queue = xQueueCreate(COMMAND_QUEUE_LENGTH, sizeof(CommandMessage));
-  uplink_window_signal = xSemaphoreCreateBinary();
+  emergency_command_queue =
+      xQueueCreate(EMERGENCY_COMMAND_QUEUE_LENGTH, sizeof(CommandMessage));
   transaction_mutex = xSemaphoreCreateMutex();
-  if (command_queue == nullptr || uplink_window_signal == nullptr ||
+  if (command_queue == nullptr || emergency_command_queue == nullptr ||
       transaction_mutex == nullptr || !start_decode_task())
   {
     Serial.println("task queue initialization failed");
@@ -837,8 +1158,7 @@ void setup()
   if (xTaskCreateUniversal(
           printPacketTask, "print_packet_task", 6144, nullptr, 1, nullptr, 0) != pdPASS ||
       xTaskCreateUniversal(
-          commandSendTask, "command_send_task", 4096, nullptr, 2,
-          &command_send_task_handle, 0) != pdPASS)
+          commandSendTask, "command_send_task", 4096, nullptr, 2, nullptr, 0) != pdPASS)
   {
     Serial.println("task creation failed");
     return;

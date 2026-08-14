@@ -1,4 +1,5 @@
 #include "protocol.h"
+#include "uplink_boundary_policy.h"
 
 #include <array>
 #include <cassert>
@@ -494,6 +495,36 @@ namespace
     const protocol::CommandResult mismatched{ids[2], 0x14, 1, 0, 0};
     assert(!tracker.markResult(mismatched));
   }
+
+  void testUplinkBoundaryPolicy()
+  {
+    assert(uplink_boundary_policy::isFresh(20000, 0, 20000));
+    assert(!uplink_boundary_policy::isFresh(20001, 0, 20000));
+    assert(uplink_boundary_policy::elapsedUs(5, UINT32_MAX - 4) == 10);
+    assert(uplink_boundary_policy::isFresh(5, UINT32_MAX - 4, 20));
+    assert(!uplink_boundary_policy::deadlineExpiredMs(2199, 0, 2200));
+    assert(uplink_boundary_policy::deadlineExpiredMs(2200, 0, 2200));
+    assert(!uplink_boundary_policy::deadlineExpiredMs(
+        5, UINT32_MAX - 4, 11));
+    assert(uplink_boundary_policy::deadlineExpiredMs(
+        5, UINT32_MAX - 4, 10));
+    uint8_t streak = uplink_boundary_policy::resetPeriodicStreak();
+    assert(streak == 0);
+    streak = uplink_boundary_policy::advancePeriodicStreak(streak);
+    assert(!uplink_boundary_policy::periodicModeActive(streak, 3));
+    streak = uplink_boundary_policy::advancePeriodicStreak(streak);
+    assert(!uplink_boundary_policy::periodicModeActive(streak, 3));
+    streak = uplink_boundary_policy::advancePeriodicStreak(streak);
+    assert(uplink_boundary_policy::periodicModeActive(streak, 3));
+    streak = uplink_boundary_policy::resetPeriodicStreak();
+    assert(streak == 0);
+    for (uint16_t count = 0; count < 300; ++count)
+    {
+      streak = uplink_boundary_policy::advancePeriodicStreak(streak);
+    }
+    assert(streak == UINT8_MAX);
+    assert(uplink_boundary_policy::periodicModeActive(streak, 3));
+  }
 } // 無名名前空間
 
 int main()
@@ -505,5 +536,6 @@ int main()
   testMalformedFrames(vectors);
   testScalarSemantics(vectors);
   testTransactionTracker();
+  testUplinkBoundaryPolicy();
   return 0;
 }

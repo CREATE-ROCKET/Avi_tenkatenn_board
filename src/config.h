@@ -18,7 +18,12 @@ constexpr uint8_t update_led = 14;
 constexpr uint32_t TELEMETRY_TIMEOUT_MS = 5000;
 constexpr uint32_t AUX_TIMEOUT_MS = 2000;
 constexpr uint32_t AUX_POLL_INTERVAL_MS = 1;
-constexpr uint32_t UPLINK_WINDOW_TIMEOUT_MS = 2000;
+// 実測した周期packet完了後の成功域に収める。
+constexpr uint32_t UPLINK_BOUNDARY_FRESH_US = 20000;
+// B1停止後に3件のA0〜A4を待てる有限時間とし、通常commandを残留させない。
+constexpr uint32_t UPLINK_BOUNDARY_TIMEOUT_MS = 2200;
+// B1を1件取りこぼしてもPeriodic modeへ誤遷移しない連続受信数。
+constexpr uint8_t UPLINK_PERIODIC_ACTIVATION_COUNT = 3;
 
 constexpr uint8_t aux = 27;
 constexpr uint8_t LoRA_RX = 26;
