@@ -204,6 +204,13 @@ namespace
     wire.back() = protocol::xorChecksum(wire.data() + 3, wire.size() - 4);
     protocol::DecodedPacket packet{};
     protocol::DecodeError error = protocol::DecodeError::None;
+    assert(!protocol::decodeApplicationFrame(
+        wire.data() + 3, wire.size() - 3, packet, error));
+    assert(error == protocol::DecodeError::InvalidEnum);
+
+    wire = vectors.at("LORA_COMMAND_RECEIVE");
+    wire[10] = 0xFF;
+    wire.back() = protocol::xorChecksum(wire.data() + 3, wire.size() - 4);
     assert(protocol::decodeApplicationFrame(
         wire.data() + 3, wire.size() - 3, packet, error));
     assert(packet.command_receive.fin_mode == 15);
@@ -267,14 +274,14 @@ namespace
     bad_result.back() = protocol::xorChecksum(bad_result.data() + 3, bad_result.size() - 4);
     assert(!protocol::decodeApplicationFrame(
         bad_result.data() + 3, bad_result.size() - 3, packet, error));
-    assert(error == protocol::DecodeError::InvalidField);
+    assert(error == protocol::DecodeError::InvalidEnum);
 
     bad_result = vectors.at("LORA_COMMAND_RESULT");
     bad_result[7] = 15;
     bad_result.back() = protocol::xorChecksum(bad_result.data() + 3, bad_result.size() - 4);
     assert(!protocol::decodeApplicationFrame(
         bad_result.data() + 3, bad_result.size() - 3, packet, error));
-    assert(error == protocol::DecodeError::InvalidField);
+    assert(error == protocol::DecodeError::InvalidEnum);
 
     auto bad_log = vectors.at("LORA_LOG_DATA");
     bad_log[5] = 0x04;

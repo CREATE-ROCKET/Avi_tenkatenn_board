@@ -1,0 +1,24 @@
+# 99L USB Serial line protocol version 1 golden vectors。
+# format: NAME|LF/CRLF|record（EOL列はtest時に実際のdelimiterへ変換する）
+RX_A0_VALID|LF|@RX usb_v=1 seq=1 board_ms=1000 dt_ms=NA rssi_present=1 rssi_raw=172 rssi_dbm=-84 valid=1 header=0xA0 len=22 error=NONE raw=A0EFCDAB039B8C13783C2A34CA07E50E000C008C0FDD
+RX_A1_VALID|LF|@RX usb_v=1 seq=2 board_ms=1500 dt_ms=500 rssi_present=1 rssi_raw=172 rssi_dbm=-84 valid=1 header=0xA1 len=24 error=NONE raw=A15AA5FEFFD204148C78CEFF2A34EA29FC3DFA7F110014C4
+RX_A2_VALID|LF|@RX usb_v=1 seq=3 board_ms=2000 dt_ms=500 rssi_present=1 rssi_raw=172 rssi_dbm=-84 valid=1 header=0xA2 len=24 error=NONE raw=A25AA5FEFFD204148C78CEFF2A34EA29FC3DFA7F110014C7
+RX_A3_VALID|LF|@RX usb_v=1 seq=4 board_ms=2500 dt_ms=500 rssi_present=1 rssi_raw=172 rssi_dbm=-84 valid=1 header=0xA3 len=24 error=NONE raw=A35AA5FEFFD204148C78CEFF2A34EA29FC3DFA7F110014C6
+RX_A4_VALID|LF|@RX usb_v=1 seq=5 board_ms=3000 dt_ms=500 rssi_present=1 rssi_raw=172 rssi_dbm=-84 valid=1 header=0xA4 len=15 error=NONE raw=A455FAFEF7F7FAFF0280FFFFF20181
+RX_A5_VALID|LF|@RX usb_v=1 seq=6 board_ms=3500 dt_ms=500 rssi_present=1 rssi_raw=172 rssi_dbm=-84 valid=1 header=0xA5 len=12 error=NONE raw=A5A0F064009CFF3C180000D6
+RX_A6_VALID|LF|@RX usb_v=1 seq=7 board_ms=4000 dt_ms=500 rssi_present=1 rssi_raw=172 rssi_dbm=-84 valid=1 header=0xA6 len=24 error=NONE raw=A6340345230103DEADBE0000000000000000000000000038
+RX_B0_VALID|LF|@RX usb_v=1 seq=8 board_ms=4500 dt_ms=500 rssi_present=1 rssi_raw=172 rssi_dbm=-84 valid=1 header=0xB0 len=10 error=NONE raw=B02A130309785634128B
+RX_B1_VALID|CRLF|@RX usb_v=1 seq=9 board_ms=5000 dt_ms=500 rssi_present=1 rssi_raw=172 rssi_dbm=-84 valid=1 header=0xB1 len=3 error=NONE raw=B107B6
+RX_A0_BAD_CHECKSUM|LF|@RX usb_v=1 seq=10 board_ms=5500 dt_ms=500 rssi_present=1 rssi_raw=172 rssi_dbm=-84 valid=0 header=0xA0 len=22 error=CHECKSUM raw=A0EFCDAB039B8C13783C2A34CA07E50E000C008C0FDC
+RX_A0_RSSI_ABSENT|LF|@RX usb_v=1 seq=11 board_ms=6000 dt_ms=500 rssi_present=0 rssi_raw=NA rssi_dbm=NA valid=1 header=0xA0 len=22 error=NONE raw=A0EFCDAB039B8C13783C2A34CA07E50E000C008C0FDD
+FRAG_UNKNOWN_HEADER|LF|@FRAG usb_v=1 seq=1 board_ms=6100 reason=UNKNOWN_HEADER len=3 raw=7F12A0
+FRAG_FRAME_TIMEOUT|LF|@FRAG usb_v=1 seq=2 board_ms=6200 reason=FRAME_TIMEOUT len=2 raw=A001
+FRAG_FRAME_OVERFLOW|LF|@FRAG usb_v=1 seq=3 board_ms=6300 reason=FRAME_OVERFLOW len=4 raw=AABBCCDD
+FRAG_RESYNC|LF|@FRAG usb_v=1 seq=4 board_ms=6400 reason=RESYNC len=2 raw=00FF
+TX_SUCCESS|LF|@TX usb_v=1 board_ms=6500 ok=1 kind=0 id=42 command=0x13 prefix=000004 len=11 raw=55002A1385FF0000000016 error=NONE
+TX_AUX_TIMEOUT|CRLF|@TX usb_v=1 board_ms=6600 ok=0 kind=0 id=42 command=0x13 prefix=000004 len=11 raw=55002A1385FF0000000016 error=AUX_TIMEOUT
+SYS_BOOT|CRLF|@SYS usb_v=1 board_ms=12 event=BOOT
+SYS_QUEUE_OVERFLOW|LF|@SYS usb_v=1 board_ms=3010 event=QUEUE_OVERFLOW source=USB_OUTPUT count=2
+SYS_UNKNOWN_EXTRA|LF|@SYS usb_v=1 board_ms=3020 event=BOOT future=VALUE
+RX_WRAP_BEFORE|LF|@RX usb_v=1 seq=4294967295 board_ms=4294967290 dt_ms=NA rssi_present=1 rssi_raw=255 rssi_dbm=-1 valid=1 header=0xB1 len=3 error=NONE raw=B107B6
+RX_WRAP_AFTER|LF|@RX usb_v=1 seq=0 board_ms=5 dt_ms=11 rssi_present=1 rssi_raw=255 rssi_dbm=-1 valid=1 header=0xB1 len=3 error=NONE raw=B107B6

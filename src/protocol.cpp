@@ -125,13 +125,6 @@ namespace protocol
                          read(reader, 16, value.east) &&
                          read(reader, 16, value.north) &&
                          read(reader, 9, value.height);
-      if (valid)
-      {
-        if (value.fin_mode > 5 && value.fin_mode < 15)
-          value.fin_mode = 15;
-        if (value.para_mode > 5 && value.para_mode < 15)
-          value.para_mode = 15;
-      }
       return valid;
     }
 
@@ -164,7 +157,7 @@ namespace protocol
     }
   } // 無名名前空間
 
-  std::size_t expectedApplicationLength(uint8_t header)
+  std::size_t applicationPacketLength(uint8_t header)
   {
     switch (static_cast<PacketHeader>(header))
     {
@@ -189,6 +182,11 @@ namespace protocol
     }
   }
 
+  bool isKnownPacketHeader(uint8_t header)
+  {
+    return applicationPacketLength(header) != 0;
+  }
+
   uint8_t xorChecksum(const uint8_t *bytes, std::size_t length)
   {
     uint8_t checksum = 0;
@@ -206,12 +204,12 @@ namespace protocol
       DecodeError &decode_error)
   {
     decode_error = DecodeError::None;
-    if (frame == nullptr || length == 0 || expectedApplicationLength(frame[0]) == 0)
+    if (frame == nullptr || length == 0 || !isKnownPacketHeader(frame[0]))
     {
       decode_error = DecodeError::UnknownHeader;
       return false;
     }
-    if (length != expectedApplicationLength(frame[0]))
+    if (length != applicationPacketLength(frame[0]))
     {
       decode_error = DecodeError::WrongLength;
       return false;
@@ -233,6 +231,15 @@ namespace protocol
     case PacketHeader::CommandReceive:
       valid = decodeCommandReceive(reader, packet.command_receive) &&
               read(reader, 4, padding);
+      if (valid &&
+          ((packet.command_receive.fin_mode > 5 &&
+            packet.command_receive.fin_mode != 15) ||
+           (packet.command_receive.para_mode > 5 &&
+            packet.command_receive.para_mode != 15)))
+      {
+        decode_error = DecodeError::InvalidEnum;
+        return false;
+      }
       break;
     case PacketHeader::LiftoffDetection:
     case PacketHeader::EngineBurn:
@@ -278,12 +285,16 @@ namespace protocol
               read(reader, 8, packet.command_result.phase) &&
               read(reader, 8, packet.command_result.reason) &&
               read(reader, 32, packet.command_result.detail);
-      if (valid &&
-          (packet.command_result.transaction_id == 0 ||
-           packet.command_result.phase > static_cast<uint8_t>(CommandPhase::Failed) ||
-           packet.command_result.reason > static_cast<uint8_t>(CommandReason::AlreadySatisfied)))
+      if (valid && packet.command_result.transaction_id == 0)
       {
         decode_error = DecodeError::InvalidField;
+        return false;
+      }
+      if (valid &&
+          (packet.command_result.phase > static_cast<uint8_t>(CommandPhase::Failed) ||
+           packet.command_result.reason > static_cast<uint8_t>(CommandReason::AlreadySatisfied)))
+      {
+        decode_error = DecodeError::InvalidEnum;
         return false;
       }
       break;
@@ -538,19 +549,23 @@ namespace protocol
     switch (decode_error)
     {
     case DecodeError::None:
-      return "None";
+      return "NONE";
     case DecodeError::UnknownHeader:
-      return "UnknownHeader";
+      return "DECODE_ERROR";
     case DecodeError::WrongLength:
-      return "WrongLength";
+      return "INVALID_LENGTH";
     case DecodeError::ChecksumMismatch:
-      return "ChecksumMismatch";
+      return "CHECKSUM";
     case DecodeError::NonZeroPadding:
-      return "NonZeroPadding";
+      return "INVALID_PADDING";
     case DecodeError::InvalidField:
-      return "InvalidField";
+      return "INVALID_FIELD";
+    case DecodeError::InvalidEnum:
+      return "INVALID_ENUM";
+    case DecodeError::DecodeFailure:
+      return "DECODE_ERROR";
     }
-    return "Unknown";
+    return "DECODE_ERROR";
   }
 
   TransactionTracker::TransactionTracker() : entries_{}, next_id_(1) {}

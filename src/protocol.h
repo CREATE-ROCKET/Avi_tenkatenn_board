@@ -32,6 +32,8 @@ namespace protocol
     ChecksumMismatch,
     NonZeroPadding,
     InvalidField,
+    InvalidEnum,
+    DecodeFailure,
   };
 
   enum class UplinkKind : uint8_t
@@ -181,7 +183,8 @@ namespace protocol
     const char *status;
   };
 
-  std::size_t expectedApplicationLength(uint8_t header);
+  std::size_t applicationPacketLength(uint8_t header);
+  bool isKnownPacketHeader(uint8_t header);
   uint8_t xorChecksum(const uint8_t *bytes, std::size_t length);
   bool decodeApplicationFrame(
       const uint8_t *frame,

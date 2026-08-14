@@ -2,6 +2,7 @@
 #include <array>
 #include <cctype>
 #include <cerrno>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <freertos/FreeRTOS.h>
@@ -13,6 +14,7 @@
 #include "decode.h"
 #include "protocol.h"
 #include "uplink_boundary_policy.h"
+#include "usb_v1.h"
 
 #ifndef GROUND_LORA_TIMING_DEBUG
 #define GROUND_LORA_TIMING_DEBUG 0
@@ -65,6 +67,13 @@ namespace
     bool boundary_observed = false;
     bool boundary_fallback = false;
     bool aux_low_observed = false;
+  };
+
+  struct UplinkWriteResult
+  {
+    bool ok;
+    usb_v1::TxError error;
+    uint32_t completed_at_ms;
   };
 
   QueueHandle_t command_queue = nullptr;
@@ -260,12 +269,12 @@ namespace
   {
     if (command_queue == nullptr)
     {
-      Serial.println("command queue full");
+      usb_v1::enqueuePretty("command queue full");
       return false;
     }
     if (xQueueSend(command_queue, &message, 0) != pdPASS)
     {
-      Serial.println("command queue full");
+      usb_v1::enqueuePretty("command queue full");
       return false;
     }
     return true;
@@ -286,13 +295,13 @@ namespace
 
   void printUsage()
   {
-    Serial.println("commands:");
-    Serial.println("  g <command> [arg0 ... arg5]");
-    Serial.println("  ae | le");
-    Serial.println("  local <command> [arg0 ... arg5]");
-    Serial.println("  time <request_id> <unix_seconds> <milliseconds>");
-    Serial.println("  release <transaction_id>");
-    Serial.println("values accept decimal or 0x-prefixed hexadecimal");
+    usb_v1::enqueuePretty("commands:");
+    usb_v1::enqueuePretty("  g <command> [arg0 ... arg5]");
+    usb_v1::enqueuePretty("  ae | le");
+    usb_v1::enqueuePretty("  local <command> [arg0 ... arg5]");
+    usb_v1::enqueuePretty("  time <request_id> <unix_seconds> <milliseconds>");
+    usb_v1::enqueuePretty("  release <transaction_id>");
+    usb_v1::enqueuePretty("values accept decimal or 0x-prefixed hexadecimal");
   }
 
   void parseArgs(char *save, std::array<uint8_t, 6> &args, bool &valid)
@@ -339,7 +348,7 @@ namespace
     {
       if (strtok_r(nullptr, " \t", &save) != nullptr)
       {
-        Serial.println("unexpected emergency argument");
+        usb_v1::enqueuePretty("unexpected emergency argument");
         return;
       }
       message.kind = std::strcmp(operation, "ae") == 0
@@ -347,7 +356,7 @@ namespace
                          : CommandMessageKind::LiftoffEmergency;
       if (!notifyEmergency(message.kind, message.requested_at_us))
       {
-        Serial.println("emergency notification failed");
+        usb_v1::enqueuePretty("emergency notification failed");
       }
       return;
     }
@@ -365,7 +374,7 @@ namespace
           !parseUnsigned(milliseconds_text, 999, milliseconds) ||
           strtok_r(nullptr, " \t", &save) != nullptr)
       {
-        Serial.println("usage: time <request_id 1..255> <unix_seconds> <milliseconds 0..999>");
+        usb_v1::enqueuePretty("usage: time <request_id 1..255> <unix_seconds> <milliseconds 0..999>");
         return;
       }
       message.kind = CommandMessageKind::GroundTimeResponse;
@@ -388,7 +397,7 @@ namespace
       if (!parseUnsigned(transaction_text, UINT8_MAX, transaction_id) ||
           transaction_id == 0 || strtok_r(nullptr, " \t", &save) != nullptr)
       {
-        Serial.println("usage: release <transaction_id 1..255>");
+        usb_v1::enqueuePretty("usage: release <transaction_id 1..255>");
         return;
       }
       message.kind = CommandMessageKind::ReleaseTransaction;
@@ -401,7 +410,7 @@ namespace
     const bool local = std::strcmp(operation, "local") == 0;
     if (!generic && !local)
     {
-      Serial.println("unknown command; type help");
+      usb_v1::enqueuePretty("unknown command; type help");
       return;
     }
     char *command_text = strtok_r(nullptr, " \t", &save);
@@ -410,7 +419,7 @@ namespace
     parseArgs(save, message.args, valid);
     if (!valid)
     {
-      Serial.println("invalid command or argument");
+      usb_v1::enqueuePretty("invalid command or argument");
       return;
     }
     message.kind = generic ? CommandMessageKind::MissionGeneric
@@ -446,34 +455,11 @@ namespace
       if (console_line_length + 1 >= sizeof(console_line))
       {
         console_line_length = 0;
-        Serial.println("console line too long");
+        usb_v1::enqueuePretty("console line too long");
         continue;
       }
       console_line[console_line_length++] = value;
     }
-  }
-
-  void printSemantic(
-      const char *label,
-      protocol::SemanticValue value,
-      double scale,
-      double offset,
-      const char *unit)
-  {
-    Serial.print(label);
-    Serial.print(": ");
-    if (!value.numeric)
-    {
-      Serial.println(value.status);
-      return;
-    }
-    Serial.print(offset + static_cast<double>(value.count) * scale, 3);
-    if (unit[0] != '\0')
-    {
-      Serial.print(' ');
-      Serial.print(unit);
-    }
-    Serial.println();
   }
 
   void updateStateLeds(protocol::PacketHeader header)
@@ -493,191 +479,81 @@ namespace
                      : LOW);
   }
 
-  void printPosition(uint16_t east, uint16_t north, uint16_t height)
+  void handlePacket(const ReceivedPacket &received)
   {
-    printSemantic("GNSS East", protocol::decodeGnssCoordinate(east), 1.0, 0.0, "m");
-    printSemantic("GNSS North", protocol::decodeGnssCoordinate(north), 1.0, 0.0, "m");
-    printSemantic("GNSS height", protocol::decodeGnssHeight(height), 5.0, -100.0, "m");
-  }
-
-  void printFlight(const protocol::DecodedPacket &packet)
-  {
-    const auto &value = packet.flight;
-    Serial.printf("Flight status: 0x%04X\r\n", value.status);
-    printSemantic("Roll", protocol::decodeRoll(value.roll), 0.5, 0.0, "deg");
-    printSemantic("Roll rate", protocol::decodeRollRate(value.roll_rate), 0.1, 0.0, "deg/s");
-    printSemantic("Tilt", protocol::decodeTiltMagnitude(value.tilt_magnitude), 0.75, 0.0, "deg");
-    printSemantic("Tilt direction", protocol::decodeTiltDirection(value.tilt_direction), 1.0, 0.0, "deg");
-    printSemantic("Fin angle", protocol::decodeFinAngle(value.fin_angle), 0.125, -15.0, "deg");
-    printSemantic("Fin rate", protocol::decodeFinRate(value.fin_rate), 0.02, 0.0, "deg/s");
-    printSemantic("LPS pressure", protocol::decodePressure(value.pressure), 0.2, 800.0, "hPa");
-    printSemantic("LPS temperature", protocol::decodeTemperature(value.temperature), 1.0, -50.0, "degC");
-    printSemantic("Airspeed", protocol::decodeAirspeed(value.airspeed), 1.0, 0.0, "m/s");
-    // TODO(SIMULATION): requested torque scale 0.002 N m/LSBを確定する。
-    printSemantic("Requested torque", protocol::decodeRequestedTorque(value.requested_torque), 0.002, 0.0, "N m");
-    printSemantic("Flight elapsed", protocol::decodeFlightElapsed(value.elapsed), 0.1, 0.0, "s");
-    printPosition(value.east, value.north, value.height);
-  }
-
-  void printCommandReceive(const protocol::CommandReceiveTelemetry &value)
-  {
-    static const char *const status_names[24] = {
-        "ICM", "LPS", "SSC", "AS5047D", "STS", "Fin zero",
-        "Para open", "Para close", "Logic battery", "Motor battery",
-        "Mission SD", "Com SD", "CAN", "Persistence", "Fin busy",
-        "Para busy", "Gyro bias", "Gravity reference", "SSC zero",
-        "Flash data", "Flash health", "Profile valid", "Fin disabled",
-        "Calibration busy"};
-    Serial.printf("CommandReceive status: 0x%06lX profile=%u fin_mode=%s para_mode=%s\r\n",
-                  static_cast<unsigned long>(value.status),
-                  value.motor_profile,
-                  protocol::finModeName(value.fin_mode),
-                  protocol::paraModeName(value.para_mode));
-    for (uint8_t bit = 0; bit < 24; ++bit)
+    usb_v1::enqueueRx(received);
+    if (!received.valid)
     {
-      Serial.printf("  %-18s: %s\r\n", status_names[bit],
-                    (value.status & (1UL << bit)) != 0 ? "YES" : "NO");
-    }
-    printSemantic("Tilt", protocol::decodeTiltMagnitude(value.tilt_magnitude), 0.75, 0.0, "deg");
-    printSemantic("Tilt direction", protocol::decodeTiltDirection(value.tilt_direction), 1.0, 0.0, "deg");
-    printSemantic("Fin angle", protocol::decodeFinAngle(value.fin_angle), 0.125, -15.0, "deg");
-    printSemantic("Parachute angle", protocol::decodeParaAngle(value.para_angle), 1.5, 0.0, "deg");
-    printSemantic("LPS pressure", protocol::decodePressure(value.pressure), 0.2, 800.0, "hPa");
-    printSemantic("LPS temperature", protocol::decodeTemperature(value.temperature), 1.0, -50.0, "degC");
-    printSemantic("Airspeed", protocol::decodeAirspeed(value.airspeed), 1.0, 0.0, "m/s");
-    printSemantic("Logic voltage", protocol::decodeBattery(value.logic_voltage), 0.05, 0.0, "V");
-    printSemantic("Motor voltage", protocol::decodeBattery(value.motor_voltage), 0.05, 0.0, "V");
-    printPosition(value.east, value.north, value.height);
-  }
-
-  void printDescent(const protocol::DescentTelemetry &value)
-  {
-    Serial.printf("Descent status: 0x%04X\r\n", value.status);
-    static const char *const status_names[] = {
-        "LPS deployment", "Elapsed deployment", "Power cutoff",
-        "Com SD", "Mission-CAN", "Deployment shock", "STS overload",
-        "STS overcurrent", "STS overtemperature", "STS encoder fault",
-        "STS voltage fault"};
-    Serial.printf("  Parachute state: %u\r\n", (value.status >> 2U) & 0x03U);
-    for (uint8_t index = 0; index < 2; ++index)
-      Serial.printf("  %-19s: %s\r\n", status_names[index],
-                    (value.status & (1U << index)) != 0 ? "YES" : "NO");
-    for (uint8_t bit = 4; bit <= 12; ++bit)
-      Serial.printf("  %-19s: %s\r\n", status_names[bit - 2],
-                    (value.status & (1U << bit)) != 0 ? "YES" : "NO");
-    printSemantic("LPS pressure", protocol::decodePressure(value.pressure), 0.2, 800.0, "hPa");
-    printSemantic("LPS temperature", protocol::decodeTemperature(value.temperature), 1.0, -50.0, "degC");
-    printSemantic("Parachute angle", protocol::decodeParaAngle(value.para_angle), 1.5, 0.0, "deg");
-    printSemantic("Descent elapsed", protocol::decodeLongElapsed(value.elapsed), 0.1, 0.0, "s");
-    printPosition(value.east, value.north, value.height);
-  }
-
-  void printRecovery(const protocol::RecoveryBeacon &value)
-  {
-    printSemantic("Logic voltage", protocol::decodeBattery(value.logic_voltage), 0.05, 0.0, "V");
-    printSemantic("Motor voltage", protocol::decodeBattery(value.motor_voltage), 0.05, 0.0, "V");
-    printPosition(value.east, value.north, value.height);
-    printSemantic("Recovery elapsed", protocol::decodeLongElapsed(value.elapsed), 10.0, 0.0, "s");
-  }
-
-  void printPacket(const ReceivedPacket &received)
-  {
-    const auto &packet = received.packet;
-    Serial.printf("\r\npacket header=0x%02X\r\n", static_cast<uint8_t>(packet.header));
-    if (received.has_receive_interval)
-    {
-      Serial.printf("Receive interval: %.3f s\r\n", received.receive_interval_ms / 1000.0);
-    }
-    else
-    {
-      Serial.println("Receive interval: N/A");
-    }
-    if (received.has_rssi)
-    {
-      Serial.printf("RSSI: %d dBm\r\n", static_cast<int>(received.rssi) - 256);
-    }
-    else
-    {
-      Serial.println("RSSI: unavailable");
+      return;
     }
 
+    const auto &packet = received.decoded;
     switch (packet.header)
     {
     case protocol::PacketHeader::CommandReceive:
-      updateStateLeds(packet.header);
-      printCommandReceive(packet.command_receive);
-      break;
     case protocol::PacketHeader::LiftoffDetection:
     case protocol::PacketHeader::EngineBurn:
     case protocol::PacketHeader::Control:
-      updateStateLeds(packet.header);
-      printFlight(packet);
-      break;
     case protocol::PacketHeader::Descent:
-      updateStateLeds(packet.header);
-      printDescent(packet.descent);
-      break;
     case protocol::PacketHeader::RecoveryBeacon:
       updateStateLeds(packet.header);
-      printRecovery(packet.recovery);
       break;
     case protocol::PacketHeader::RecoveryLogData:
-      Serial.printf("Recovery log transfer=%u source=%u eof=%u offset=%lu length=%u data=",
-                    packet.recovery_log.transfer_id,
-                    packet.recovery_log.meta & 1U,
-                    (packet.recovery_log.meta >> 1U) & 1U,
-                    static_cast<unsigned long>(packet.recovery_log.offset),
-                    packet.recovery_log.data_length);
-      for (uint8_t index = 0; index < packet.recovery_log.data_length; ++index)
-      {
-        Serial.printf("%02X", packet.recovery_log.data[index]);
-      }
-      Serial.println();
       break;
     case protocol::PacketHeader::CommandResult:
     {
       const auto &result = packet.command_result;
 #if GROUND_LORA_TIMING_DEBUG
-      Serial.printf("GROUND_LORA_TIMING event=result_received transaction_id=%u command=0x%02X received_at_us=%lu\r\n",
-                    result.transaction_id, result.command,
-                    static_cast<unsigned long>(received.received_at_us));
+      usb_v1::enqueuePrettyf(
+          "GROUND_LORA_TIMING event=result_received transaction_id=%u command=0x%02X received_at_us=%lu",
+          result.transaction_id, result.command,
+          static_cast<unsigned long>(received.received_at_us));
 #endif
-      Serial.printf("CommandResult id=%u command=0x%02X phase=%s reason=%s detail=0x%08lX\r\n",
-                    result.transaction_id, result.command,
-                    protocol::phaseName(result.phase),
-                    protocol::reasonName(result.reason),
-                    static_cast<unsigned long>(result.detail));
+      usb_v1::enqueuePrettyf(
+          "CommandResult id=%u command=0x%02X phase=%s reason=%s detail=0x%08lX",
+          result.transaction_id, result.command,
+          protocol::phaseName(result.phase), protocol::reasonName(result.reason),
+          static_cast<unsigned long>(result.detail));
       if (!markTransactionResult(result))
       {
-        Serial.printf("unmatched CommandResult id=%u command=0x%02X\r\n",
-                      result.transaction_id, result.command);
+        usb_v1::enqueuePrettyf(
+            "unmatched CommandResult id=%u command=0x%02X",
+            result.transaction_id, result.command);
       }
       break;
     }
     case protocol::PacketHeader::GroundTimeRequest:
-      Serial.printf("GroundTimeRequest id=%u; reply with: time %u <unix> <ms>\r\n",
-                    packet.time_request.request_id,
-                    packet.time_request.request_id);
+      usb_v1::enqueuePrettyf(
+          "GroundTimeRequest id=%u; reply with: time %u <unix> <ms>",
+          packet.time_request.request_id, packet.time_request.request_id);
       break;
-    }
-    const uint32_t dropped = dropped_packet_count();
-    if (dropped != 0)
-    {
-      Serial.printf("Ground packet queue drops: %lu\r\n",
-                    static_cast<unsigned long>(dropped));
     }
   }
 
-  bool writeUplink(const protocol::UplinkFrame &uplink,
-                   const std::array<uint8_t, protocol::UPLINK_FRAME_SIZE> &application,
-                   const char *source,
-                   UplinkTiming &timing)
+  void handleDecodeEvent(const DecodeEvent &event)
+  {
+    if (event.kind == DecodeEventKind::Packet)
+    {
+      handlePacket(event.packet);
+    }
+    else
+    {
+      usb_v1::enqueueFragment(event.fragment);
+    }
+  }
+  UplinkWriteResult writeUplink(
+      const protocol::UplinkFrame &uplink,
+      const std::array<uint8_t, protocol::UPLINK_FRAME_SIZE> &application,
+      const char *source, UplinkTiming &timing)
   {
     // 呼出側がframeをencodeし、送信直前のAUX Highを確認済みであること。
     const uint8_t prefix[] = {ADD_H, ADD_L, CHNNL};
     timing.write_started_at_us = micros();
-    Serial1.write(prefix, sizeof(prefix));
-    Serial1.write(application.data(), application.size());
+    const std::size_t prefix_written = Serial1.write(prefix, sizeof(prefix));
+    const std::size_t application_written =
+        Serial1.write(application.data(), application.size());
+    const bool write_complete = prefix_written == sizeof(prefix) &&
+                                application_written == application.size();
     timing.write_finished_at_us = micros();
     if (digitalRead(aux) == LOW)
     {
@@ -691,15 +567,19 @@ namespace
       timing.aux_low_observed = true;
       timing.aux_low_at_us = micros();
     }
-    if (!waitAuxHigh(AUX_TIMEOUT_MS))
+    const bool aux_completed = waitAuxHigh(AUX_TIMEOUT_MS);
+    if (!write_complete)
     {
-      Serial.println("AUX timeout after uplink");
-      return false;
+      return {false, usb_v1::TxError::UartWrite, millis()};
+    }
+    if (!aux_completed)
+    {
+      return {false, usb_v1::TxError::AuxTimeout, millis()};
     }
     timing.aux_high_at_us = micros();
     timing.completed_at_us = timing.aux_high_at_us;
 #if GROUND_LORA_TIMING_DEBUG
-    Serial.printf("GROUND_LORA_TIMING source=%s transaction_id=%u requested_at_us=%lu dequeued_at_us=%lu boundary_kind=%s boundary_header=0x%02X boundary_sequence=%lu boundary_received_at_us=%lu boundary_age_us=%lu boundary_wait_us=%lu boundary_fallback=%u aux_ready_at_us=%lu write_started_at_us=%lu write_finished_at_us=%lu flush_finished_at_us=%lu aux_low_observed=%u aux_low_at_us=%lu aux_high_at_us=%lu completed_at_us=%lu\r\n",
+    usb_v1::enqueuePrettyf("GROUND_LORA_TIMING source=%s transaction_id=%u requested_at_us=%lu dequeued_at_us=%lu boundary_kind=%s boundary_header=0x%02X boundary_sequence=%lu boundary_received_at_us=%lu boundary_age_us=%lu boundary_wait_us=%lu boundary_fallback=%u aux_ready_at_us=%lu write_started_at_us=%lu write_finished_at_us=%lu flush_finished_at_us=%lu aux_low_observed=%u aux_low_at_us=%lu aux_high_at_us=%lu completed_at_us=%lu",
                   source, uplink.transaction_id,
                   static_cast<unsigned long>(timing.requested_at_us),
                   static_cast<unsigned long>(timing.dequeued_at_us),
@@ -723,7 +603,7 @@ namespace
 #else
     (void)source;
 #endif
-    return true;
+    return {true, usb_v1::TxError::None, millis()};
   }
 
   bool takeEmergencyCommand(CommandMessage &message)
@@ -779,7 +659,7 @@ namespace
       }
       if (!reserveTransaction(kind, tracked_command, transaction_id))
       {
-        Serial.println("no free transaction ID");
+        usb_v1::enqueuePretty("no free transaction ID");
         return;
       }
       reserved = true;
@@ -793,20 +673,44 @@ namespace
       {
         releaseTransaction(transaction_id);
       }
-      Serial.printf("uplink failed id=%u\r\n", transaction_id);
+      usb_v1::enqueuePrettyf("uplink failed id=%u", transaction_id);
       return;
     }
 
     const bool emergency =
         message.kind == CommandMessageKind::ActuatorEmergency ||
         message.kind == CommandMessageKind::LiftoffEmergency;
-    const auto fail_before_uplink = [&](const char *reason) {
+    bool tx_record_emitted = false;
+    const auto emit_tx = [&](bool ok, usb_v1::TxError error,
+                             uint32_t completed_at_ms) {
+      if (tx_record_emitted)
+      {
+        return;
+      }
+      usb_v1::TxRecord tx_record{};
+      tx_record.board_ms = completed_at_ms;
+      tx_record.ok = ok;
+      tx_record.kind = static_cast<uint8_t>(uplink.kind);
+      tx_record.id = transaction_id;
+      tx_record.command = uplink.command;
+      tx_record.prefix = {ADD_H, ADD_L, CHNNL};
+      tx_record.raw = application;
+      tx_record.error = error;
+      usb_v1::enqueueTx(tx_record);
+      tx_record_emitted = true;
+    };
+    const auto fail_before_uplink = [&](const char *reason,
+                                        bool report_aux_timeout) {
       if (reserved)
       {
         releaseTransaction(transaction_id);
       }
-      Serial.printf("%s before uplink\r\n", reason);
-      Serial.printf("uplink failed id=%u\r\n", transaction_id);
+      if (report_aux_timeout)
+      {
+        emit_tx(false, usb_v1::TxError::AuxTimeout, millis());
+      }
+      usb_v1::enqueuePrettyf("%s before uplink", reason);
+      usb_v1::enqueuePrettyf("uplink failed id=%u", transaction_id);
     };
 
     UplinkBoundary boundary{};
@@ -840,7 +744,7 @@ namespace
       {
         if (!waitAuxHigh(AUX_TIMEOUT_MS))
         {
-          fail_before_uplink("AUX timeout");
+          fail_before_uplink("AUX timeout", true);
           return;
         }
         record_aux_ready();
@@ -852,18 +756,18 @@ namespace
         if (aux_opportunity == TxOpportunity::Timeout)
         {
 #if GROUND_LORA_TIMING_DEBUG
-          Serial.printf("GROUND_LORA_TIMING event=pre_tx_timeout source=%s requested_at_us=%lu dequeued_at_us=%lu\r\n",
+          usb_v1::enqueuePrettyf("GROUND_LORA_TIMING event=pre_tx_timeout source=%s requested_at_us=%lu dequeued_at_us=%lu",
                         commandKindName(message.kind),
                         static_cast<unsigned long>(message.requested_at_us),
                         static_cast<unsigned long>(message.dequeued_at_us));
 #endif
-          fail_before_uplink("AUX timeout");
+          fail_before_uplink("AUX timeout", true);
           return;
         }
         if (aux_opportunity == TxOpportunity::EmergencyPending)
         {
 #if GROUND_LORA_TIMING_DEBUG
-          Serial.printf("GROUND_LORA_TIMING event=normal_preempted stage=aux_wait normal=%s emergency=%s requested_at_us=%lu\r\n",
+          usb_v1::enqueuePrettyf("GROUND_LORA_TIMING event=normal_preempted stage=aux_wait normal=%s emergency=%s requested_at_us=%lu",
                         commandKindName(message.kind),
                         commandKindName(pending_emergency.kind),
                         static_cast<unsigned long>(pending_emergency.requested_at_us));
@@ -881,7 +785,7 @@ namespace
       if (boundary_opportunity == TxOpportunity::EmergencyPending)
       {
 #if GROUND_LORA_TIMING_DEBUG
-        Serial.printf("GROUND_LORA_TIMING event=normal_preempted stage=boundary_wait normal=%s emergency=%s requested_at_us=%lu\r\n",
+        usb_v1::enqueuePrettyf("GROUND_LORA_TIMING event=normal_preempted stage=boundary_wait normal=%s emergency=%s requested_at_us=%lu",
                       commandKindName(message.kind),
                       commandKindName(pending_emergency.kind),
                       static_cast<unsigned long>(pending_emergency.requested_at_us));
@@ -894,21 +798,21 @@ namespace
         if (!emergency)
         {
 #if GROUND_LORA_TIMING_DEBUG
-          Serial.printf("GROUND_LORA_TIMING event=boundary_timeout source=%s timeout_ms=%lu requested_at_us=%lu dequeued_at_us=%lu boundary_wait_us=%lu\r\n",
+          usb_v1::enqueuePrettyf("GROUND_LORA_TIMING event=boundary_timeout source=%s timeout_ms=%lu requested_at_us=%lu dequeued_at_us=%lu boundary_wait_us=%lu",
                         commandKindName(message.kind),
                         static_cast<unsigned long>(UPLINK_BOUNDARY_TIMEOUT_MS),
                         static_cast<unsigned long>(message.requested_at_us),
                         static_cast<unsigned long>(message.dequeued_at_us),
                         static_cast<unsigned long>(timing.boundary_wait_us));
 #endif
-          fail_before_uplink("downlink boundary timeout");
+          fail_before_uplink("downlink boundary timeout", false);
           return;
         }
         // 2200 ms安全境界を得られない場合はavailabilityを優先して直接送る。
         // telemetry継続中でも、このfallbackはdownlinkと衝突し得る。
         timing.boundary_fallback = true;
 #if GROUND_LORA_TIMING_DEBUG
-        Serial.printf("GROUND_LORA_TIMING event=emergency_boundary_fallback source=%s requested_at_us=%lu dequeued_at_us=%lu boundary_wait_us=%lu\r\n",
+        usb_v1::enqueuePrettyf("GROUND_LORA_TIMING event=emergency_boundary_fallback source=%s requested_at_us=%lu dequeued_at_us=%lu boundary_wait_us=%lu",
                       commandKindName(message.kind),
                       static_cast<unsigned long>(message.requested_at_us),
                       static_cast<unsigned long>(message.dequeued_at_us),
@@ -917,7 +821,7 @@ namespace
         // timeout確定後はboundaryを再待機せず、AUX Highだけを有限待機する。
         if (!waitAuxHigh(AUX_TIMEOUT_MS))
         {
-          fail_before_uplink("AUX timeout");
+          fail_before_uplink("AUX timeout", true);
           return;
         }
         record_aux_ready();
@@ -938,7 +842,7 @@ namespace
         if (!aux_still_high || !boundary_still_fresh)
         {
 #if GROUND_LORA_TIMING_DEBUG
-          Serial.printf("GROUND_LORA_TIMING event=boundary_invalidated source=%s aux_high=%u boundary_age_us=%lu boundary_sequence=%lu\r\n",
+          usb_v1::enqueuePrettyf("GROUND_LORA_TIMING event=boundary_invalidated source=%s aux_high=%u boundary_age_us=%lu boundary_sequence=%lu",
                         commandKindName(message.kind),
                         aux_still_high ? 1U : 0U,
                         static_cast<unsigned long>(timing.boundary_age_us),
@@ -953,7 +857,7 @@ namespace
       if (!emergency && takeEmergencyCommand(pending_emergency))
       {
 #if GROUND_LORA_TIMING_DEBUG
-        Serial.printf("GROUND_LORA_TIMING event=normal_preempted stage=uart_commit normal=%s emergency=%s requested_at_us=%lu\r\n",
+        usb_v1::enqueuePrettyf("GROUND_LORA_TIMING event=normal_preempted stage=uart_commit normal=%s emergency=%s requested_at_us=%lu",
                       commandKindName(message.kind),
                       commandKindName(pending_emergency.kind),
                       static_cast<unsigned long>(pending_emergency.requested_at_us));
@@ -966,18 +870,21 @@ namespace
     }
 
     // commit point以降の一回のUART送信はnonpreemptibleとする。
-    if (!writeUplink(uplink, application, commandKindName(message.kind), timing))
+    const UplinkWriteResult write_result =
+        writeUplink(uplink, application, commandKindName(message.kind), timing);
+    emit_tx(write_result.ok, write_result.error, write_result.completed_at_ms);
+    if (!write_result.ok)
     {
       if (reserved)
       {
         releaseTransaction(transaction_id);
       }
-      Serial.printf("uplink failed id=%u\r\n", transaction_id);
+      usb_v1::enqueuePrettyf("uplink failed id=%u", transaction_id);
       return;
     }
-    Serial.printf("uplink sent kind=%u id=%u command=0x%02X\r\n",
-                  static_cast<uint8_t>(uplink.kind), transaction_id,
-                  uplink.command);
+    usb_v1::enqueuePrettyf("uplink sent kind=%u id=%u command=0x%02X",
+                           static_cast<uint8_t>(uplink.kind), transaction_id,
+                           uplink.command);
   }
 
   void commandSendTask(void *)
@@ -997,10 +904,15 @@ namespace
       message.dequeued_at_us = micros();
       if (message.kind == CommandMessageKind::ReleaseTransaction)
       {
-        Serial.printf("transaction id=%u %s\r\n", message.command,
-                      releaseTransaction(message.command)
-                          ? "released"
-                          : "was not pending");
+        const bool released = releaseTransaction(message.command);
+        usb_v1::SystemRecord system{};
+        system.board_ms = millis();
+        system.event = usb_v1::SystemEvent::TransactionRelease;
+        system.id = message.command;
+        system.ok = released;
+        usb_v1::enqueueSystem(system);
+        usb_v1::enqueuePrettyf("transaction id=%u %s", message.command,
+                               released ? "released" : "was not pending");
         continue;
       }
 
@@ -1010,12 +922,25 @@ namespace
 
   void printPacketTask(void *)
   {
+    uint32_t reported_drops = 0;
     for (;;)
     {
-      ReceivedPacket packet{};
-      if (receive_packet(packet, portMAX_DELAY))
+      DecodeEvent event{};
+      if (receive_decode_event(event, portMAX_DELAY))
       {
-        printPacket(packet);
+        handleDecodeEvent(event);
+      }
+      const uint32_t dropped = dropped_packet_count();
+      if (dropped != reported_drops)
+      {
+        usb_v1::SystemRecord overflow{};
+        overflow.board_ms = millis();
+        overflow.event = usb_v1::SystemEvent::QueueOverflow;
+        overflow.count = dropped - reported_drops;
+        std::snprintf(overflow.source.data(), overflow.source.size(),
+                      "DECODE_EVENT");
+        usb_v1::enqueueSystem(overflow);
+        reported_drops = dropped;
       }
     }
   }
@@ -1029,10 +954,11 @@ namespace
     {
       Serial1.read();
     }
-    Serial.println("Writing LoRa settings...");
+    Serial.println("# Writing LoRa settings...");
     Serial1.write(settingCmd, sizeof(settingCmd));
     Serial1.flush();
     delay(200);
+    Serial.print("# LoRa setup response:");
     while (Serial1.available() > 0)
     {
       const uint8_t value = static_cast<uint8_t>(Serial1.read());
@@ -1044,7 +970,7 @@ namespace
       Serial.print(' ');
     }
     Serial.println();
-    Serial.println("LoRa setup finished. Restore Communication mode and upload again.");
+    Serial.println("# LoRa setup finished. Restore Communication mode and upload again.");
   }
 
   void readLoraSettings()
@@ -1056,7 +982,7 @@ namespace
     bool received = false;
     if (!waitAuxHigh(AUX_TIMEOUT_MS))
     {
-      Serial.println("LoRa readback: AUX timeout before command");
+      Serial.println("# LoRa readback: AUX timeout before command");
     }
     else
     {
@@ -1070,10 +996,10 @@ namespace
       Serial1.flush();
       if (!waitAuxHigh(AUX_TIMEOUT_MS))
       {
-        Serial.println("LoRa readback: AUX timeout after command");
+        Serial.println("# LoRa readback: AUX timeout after command");
       }
 
-      Serial.print("LoRa readback raw:");
+      Serial.print("# LoRa readback raw:");
       const uint32_t started_at = millis();
       uint32_t last_received_at = started_at;
       while (millis() - started_at < 2000)
@@ -1094,7 +1020,7 @@ namespace
       Serial.println();
       if (!received)
       {
-        Serial.println("LoRa readback: no response");
+        Serial.println("# LoRa readback: no response");
       }
     }
 
@@ -1104,11 +1030,11 @@ namespace
     delay(100);
     if (!waitAuxHigh(AUX_TIMEOUT_MS))
     {
-      Serial.println("LoRa readback: AUX timeout while restoring communication mode");
+      Serial.println("# LoRa readback: AUX timeout while restoring communication mode");
     }
     Serial1.end();
     Serial1.begin(115200, SERIAL_8N1, LoRA_RX, LoRA_TX);
-    Serial.println("LoRa readback finished; communication mode restored");
+    Serial.println("# LoRa readback finished; communication mode restored");
   }
 } // 無名名前空間
 
@@ -1145,24 +1071,70 @@ void setup()
   digitalWrite(control_led, LOW);
   digitalWrite(update_led, LOW);
 
+  if (!usb_v1::initialize())
+  {
+    return;
+  }
+  usb_v1::SystemRecord boot{};
+  boot.board_ms = millis();
+  boot.event = usb_v1::SystemEvent::Boot;
+  usb_v1::enqueueSystem(boot);
+
+  const auto report_init_failure = [](const char *task) {
+    usb_v1::SystemRecord failure{};
+    failure.board_ms = millis();
+    failure.event = usb_v1::SystemEvent::TaskInitFailed;
+    std::snprintf(failure.task.data(), failure.task.size(), "%s", task);
+    std::snprintf(failure.error.data(), failure.error.size(), "NO_MEMORY");
+    usb_v1::enqueueSystem(failure);
+  };
+
   command_queue = xQueueCreate(COMMAND_QUEUE_LENGTH, sizeof(CommandMessage));
+  if (command_queue == nullptr)
+  {
+    report_init_failure("COMMAND_QUEUE");
+    return;
+  }
   emergency_command_queue =
       xQueueCreate(EMERGENCY_COMMAND_QUEUE_LENGTH, sizeof(CommandMessage));
+  if (emergency_command_queue == nullptr)
+  {
+    report_init_failure("EMERGENCY_QUEUE");
+    return;
+  }
   transaction_mutex = xSemaphoreCreateMutex();
-  if (command_queue == nullptr || emergency_command_queue == nullptr ||
-      transaction_mutex == nullptr || !start_decode_task())
+  if (transaction_mutex == nullptr)
   {
-    Serial.println("task queue initialization failed");
+    report_init_failure("TRANSACTION_MUTEX");
     return;
   }
-  if (xTaskCreateUniversal(
-          printPacketTask, "print_packet_task", 6144, nullptr, 1, nullptr, 0) != pdPASS ||
-      xTaskCreateUniversal(
-          commandSendTask, "command_send_task", 4096, nullptr, 2, nullptr, 0) != pdPASS)
+  if (!start_decode_task())
   {
-    Serial.println("task creation failed");
+    report_init_failure("DECODE");
     return;
   }
+  const bool print_task_ready = xTaskCreateUniversal(
+                                    printPacketTask, "print_packet_task", 6144,
+                                    nullptr, 1, nullptr, 0) == pdPASS;
+  const bool command_task_ready = print_task_ready &&
+                                  xTaskCreateUniversal(
+                                      commandSendTask, "command_send_task", 4096,
+                                      nullptr, 2, nullptr, 0) == pdPASS;
+  if (!print_task_ready || !command_task_ready)
+  {
+    usb_v1::SystemRecord failure{};
+    failure.board_ms = millis();
+    failure.event = usb_v1::SystemEvent::TaskInitFailed;
+    std::snprintf(failure.task.data(), failure.task.size(), "%s",
+                  print_task_ready ? "COMMAND" : "PACKET");
+    std::snprintf(failure.error.data(), failure.error.size(), "NO_MEMORY");
+    usb_v1::enqueueSystem(failure);
+    return;
+  }
+  usb_v1::SystemRecord ready{};
+  ready.board_ms = millis();
+  ready.event = usb_v1::SystemEvent::Ready;
+  usb_v1::enqueueSystem(ready);
   printUsage();
 }
 
