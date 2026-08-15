@@ -2,20 +2,17 @@ from pathlib import Path
 
 path = Path("test/host_protocol/test_main.cpp")
 text = path.read_text(encoding="utf-8")
-old = """void testMissionLinkFallbackHeaderMigration() {
-  USBV1Decoder decoder;
+old = """  void testMissionLinkFallbackHeaderMigration()
+  {
+    std::array<uint8_t, 24> frame{};
 """
-new = """void testMissionLinkFallbackHeaderMigration() {
-  USBV1Decoder decoder;
+new = """  void testMissionLinkFallbackHeaderMigration()
+  {
+    const auto vectors = loadVectors();
+    const auto shared = decode(vectors, \"LORA_MISSION_LINK_FALLBACK\");
+    assert(shared.header == protocol::PacketHeader::MissionLinkFallbackTelemetry);
 
-  const auto shared =
-      hexToBytes(goldenValue(\"LORA_MISSION_LINK_FALLBACK\"));
-  assert(shared.size() == 27);
-  assert(shared[0] == 0x00 && shared[1] == 0x00 && shared[2] == 0x04);
-  const std::vector<uint8_t> shared_app(shared.begin() + 3, shared.end());
-  const auto shared_decoded = decoder.decode(makeRxLine(shared_app, -84));
-  assert(std::holds_alternative<usbv1::MissionLinkFallbackTelemetry>(
-      shared_decoded.payload));
+    std::array<uint8_t, 24> frame{};
 """
 if text.count(old) != 1:
     raise SystemExit("shared fallback host-test anchor was not unique")
