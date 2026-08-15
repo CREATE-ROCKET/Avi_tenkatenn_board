@@ -32,6 +32,25 @@ namespace
     return vectors;
   }
 
+  std::map<std::string, std::string> loadControlRollRawVectors()
+  {
+    std::ifstream input("testdata/99l_control_roll_v2_vectors.txt");
+    assert(input.good());
+    std::map<std::string, std::string> vectors;
+    std::string line;
+    while (std::getline(input, line))
+    {
+      if (line.empty() || line[0] == '#')
+        continue;
+      const std::size_t first = line.find('|');
+      const std::size_t second = line.find('|', first + 1);
+      assert(first != std::string::npos && second != std::string::npos);
+      vectors.emplace(line.substr(0, first),
+                      line.substr(first + 1, second - first - 1));
+    }
+    return vectors;
+  }
+
   std::string field(const std::string &line, const std::string &key)
   {
     const std::string marker = " " + key + '=';
@@ -139,6 +158,23 @@ namespace
     const ReceivedPacket without_rssi = decode(field(absent, "raw"), 6000, false);
     assert(without_rssi.valid && !without_rssi.rssi_present);
     assert(formatRx(without_rssi, 11, true, 5500) == absent);
+  }
+
+  void testControlRollGoldenStream()
+  {
+    const auto vectors = loadControlRollRawVectors();
+    assert(vectors.size() == 8);
+    uint32_t sequence = 100;
+    for (const auto &entry : vectors)
+    {
+      const ReceivedPacket packet = decode(entry.second, sequence, true);
+      assert(packet.valid);
+      assert(packet.header == 0xA7);
+      assert(packet.application_length == 9);
+      assert(packet.decoded.header == protocol::PacketHeader::ControlRollTelemetryV2);
+      assert(field(formatRx(packet, sequence, false, 0), "raw") == entry.second);
+      ++sequence;
+    }
   }
 
   void testStreamFragments()
@@ -323,6 +359,7 @@ int main()
 {
   const auto vectors = loadVectors("testdata/99l_usb_v1_vectors.txt");
   testGoldenRx(vectors);
+  testControlRollGoldenStream();
   testStreamFragments();
   testBackToBack(vectors);
   testFormatters(vectors);

@@ -10,6 +10,9 @@ namespace protocol
   constexpr std::size_t UPLINK_FRAME_SIZE = 11;
   constexpr std::size_t MAX_PENDING_TRANSACTIONS = 16;
   constexpr std::size_t EMERGENCY_RESERVED_TRANSACTIONS = 2;
+  constexpr uint8_t CONTROL_ROLL_TELEMETRY_V2_SCHEMA_VERSION = 2;
+  constexpr char CONTROL_ROLL_TELEMETRY_V2_VAULT_SOURCE[] =
+      "f789fdef395c7b066d838a8f566ea4984231ab34";
 
   enum class PacketHeader : uint8_t
   {
@@ -20,6 +23,8 @@ namespace protocol
     Descent = 0xA4,
     RecoveryBeacon = 0xA5,
     RecoveryLogData = 0xA6,
+    ControlRollTelemetryV2 = 0xA7,
+    MissionLinkFallbackTelemetry = 0xA8,
     CommandResult = 0xB0,
     GroundTimeRequest = 0xB1,
   };
@@ -142,6 +147,34 @@ namespace protocol
     std::array<uint8_t, 16> data;
   };
 
+  struct ControlRollTelemetryV2
+  {
+    uint8_t schema_version;
+    uint16_t control_roll_reference_unwrapped;
+    uint16_t roll_deviation_unwrapped;
+    uint8_t flags;
+    uint8_t capture_event_sequence;
+  };
+
+  struct MissionLinkFallbackTelemetry
+  {
+    uint8_t schema_version;
+    uint8_t sequence;
+    uint8_t primary_loss_reason;
+    uint16_t status_flags;
+    uint8_t last_valid_mission_state;
+    uint8_t gnss_state;
+    uint16_t mission_status_age;
+    uint16_t any_mission_periodic_age;
+    uint16_t power_time_age;
+    uint16_t east;
+    uint16_t north;
+    uint16_t height;
+    uint8_t logic_voltage;
+    uint8_t motor_voltage;
+    uint8_t can_health;
+  };
+
   struct CommandResult
   {
     uint8_t transaction_id;
@@ -164,6 +197,8 @@ namespace protocol
     DescentTelemetry descent{};
     RecoveryBeacon recovery{};
     RecoveryLogData recovery_log{};
+    ControlRollTelemetryV2 control_roll_v2{};
+    MissionLinkFallbackTelemetry mission_link_fallback{};
     CommandResult command_result{};
     GroundTimeRequest time_request{};
   };
@@ -197,6 +232,7 @@ namespace protocol
 
   int32_t signExtend(uint32_t raw, uint8_t bits);
   SemanticValue decodeRoll(uint16_t raw);
+  SemanticValue decodeControlRollV2(uint16_t raw);
   SemanticValue decodeRollRate(uint16_t raw);
   SemanticValue decodeTiltMagnitude(uint8_t raw);
   SemanticValue decodeTiltDirection(uint16_t raw);

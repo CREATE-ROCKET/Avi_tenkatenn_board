@@ -7,11 +7,25 @@
 #include <cstdint>
 #include <fstream>
 #include <map>
+#include <sstream>
 #include <string>
 #include <vector>
 
 namespace
 {
+  struct ControlRollVector
+  {
+    std::vector<uint8_t> raw;
+    bool reference_numeric;
+    int32_t reference_count;
+    bool deviation_numeric;
+    int32_t deviation_count;
+    std::string reference_status;
+    std::string deviation_status;
+    uint8_t flags;
+    uint8_t capture_sequence;
+  };
+
   std::vector<uint8_t> fromHex(const std::string &hex)
   {
     assert(hex.size() % 2 == 0);
@@ -38,6 +52,37 @@ namespace
       const std::size_t separator = line.find('=');
       assert(separator != std::string::npos);
       vectors.emplace(line.substr(0, separator), fromHex(line.substr(separator + 1)));
+    }
+    return vectors;
+  }
+
+  std::map<std::string, ControlRollVector> loadControlRollVectors()
+  {
+    std::ifstream input("testdata/99l_control_roll_v2_vectors.txt");
+    assert(input.good());
+    std::map<std::string, ControlRollVector> vectors;
+    std::string line;
+    while (std::getline(input, line))
+    {
+      if (line.empty() || line[0] == '#')
+        continue;
+      std::vector<std::string> columns;
+      std::stringstream stream(line);
+      std::string column;
+      while (std::getline(stream, column, '|'))
+        columns.push_back(column);
+      assert(columns.size() == 8);
+      ControlRollVector vector{};
+      vector.raw = fromHex(columns[1]);
+      vector.reference_numeric = columns[2] != "NA";
+      vector.reference_count = vector.reference_numeric ? std::stoi(columns[2]) : 0;
+      vector.deviation_numeric = columns[3] != "NA";
+      vector.deviation_count = vector.deviation_numeric ? std::stoi(columns[3]) : 0;
+      vector.reference_status = columns[4];
+      vector.deviation_status = columns[5];
+      vector.flags = static_cast<uint8_t>(std::stoul(columns[6], nullptr, 0));
+      vector.capture_sequence = static_cast<uint8_t>(std::stoul(columns[7], nullptr, 0));
+      vectors.emplace(columns[0], vector);
     }
     return vectors;
   }
@@ -219,6 +264,130 @@ namespace
     assert(std::string(protocol::paraModeName(packet.command_receive.para_mode)) == "Unknown");
     assert(std::string(protocol::finModeName(5)) == "RollControl");
     assert(std::string(protocol::paraModeName(5)) == "PoweredOff");
+  }
+
+  void testControlRollTelemetryV2()
+  {
+    assert(std::string(protocol::CONTROL_ROLL_TELEMETRY_V2_VAULT_SOURCE) ==
+           "f789fdef395c7b066d838a8f566ea4984231ab34");
+    const auto vectors = loadControlRollVectors();
+    assert(vectors.size() == 8);
+    for (const auto &entry : vectors)
+    {
+      const ControlRollVector &expected = entry.second;
+      assert(expected.raw.size() == 9);
+      protocol::DecodedPacket packet{};
+      protocol::DecodeError error = protocol::DecodeError::None;
+      assert(protocol::decodeApplicationFrame(
+          expected.raw.data(), expected.raw.size(), packet, error));
+      assert(packet.header == protocol::PacketHeader::ControlRollTelemetryV2);
+      const auto &value = packet.control_roll_v2;
+      assert(value.schema_version == 2);
+      assert(value.flags == expected.flags);
+      assert(value.capture_event_sequence == expected.capture_sequence);
+
+      const protocol::SemanticValue reference = protocol::decodeControlRollV2(
+          value.control_roll_reference_unwrapped);
+      const protocol::SemanticValue deviation = protocol::decodeControlRollV2(
+          value.roll_deviation_unwrapped);
+      assert(reference.numeric == expected.reference_numeric);
+      assert(deviation.numeric == expected.deviation_numeric);
+      if (expected.reference_numeric)
+      {
+        assert(reference.count == expected.reference_count);
+      }
+      else
+      {
+        assert(std::string(reference.status) == expected.reference_status);
+      }
+      if (expected.deviation_numeric)
+      {
+        assert(deviation.count == expected.deviation_count);
+      }
+      else
+      {
+        assert(std::string(deviation.status) == expected.deviation_status);
+      }
+    }
+
+    assert(protocol::decodeControlRollV2(760).count == 760);
+    assert(protocol::decodeControlRollV2(1440).count == 1440);
+    assert(protocol::decodeControlRollV2(0xFA60).count == -1440);
+    assert(protocol::decodeControlRollV2(760).count * 0.5 == 380.0);
+    assert(protocol::decodeControlRollV2(1440).count * 0.5 == 720.0);
+    assert(protocol::decodeControlRollV2(0xFA60).count * 0.5 == -720.0);
+    assert(protocol::decodeRoll(760).count == 760); // v1 roll remains independent.
+
+    protocol::DecodedPacket packet{};
+    protocol::DecodeError error = protocol::DecodeError::None;
+    auto malformed = vectors.at("PLUS_380").raw;
+    malformed[1] = 1;
+    malformed.back() = protocol::xorChecksum(malformed.data(), malformed.size() - 1);
+    assert(!protocol::decodeApplicationFrame(
+        malformed.data(), malformed.size(), packet, error));
+    assert(error == protocol::DecodeError::InvalidField);
+    malformed = vectors.at("PLUS_380").raw;
+    malformed[6] |= 0x20;
+    malformed.back() = protocol::xorChecksum(malformed.data(), malformed.size() - 1);
+    assert(!protocol::decodeApplicationFrame(
+        malformed.data(), malformed.size(), packet, error));
+    assert(error == protocol::DecodeError::InvalidField);
+    malformed = vectors.at("OUT_OF_RANGE").raw;
+    malformed[6] = 0;
+    malformed.back() = protocol::xorChecksum(malformed.data(), malformed.size() - 1);
+    assert(!protocol::decodeApplicationFrame(
+        malformed.data(), malformed.size(), packet, error));
+    assert(error == protocol::DecodeError::InvalidField);
+
+    std::array<uint8_t, 24> old_a7_fallback{};
+    old_a7_fallback[0] = 0xA7;
+    old_a7_fallback.back() = protocol::xorChecksum(
+        old_a7_fallback.data(), old_a7_fallback.size() - 1);
+    assert(!protocol::decodeApplicationFrame(
+        old_a7_fallback.data(), old_a7_fallback.size(), packet, error));
+    assert(error == protocol::DecodeError::WrongLength);
+  }
+
+  void testMissionLinkFallbackHeaderMigration()
+  {
+    std::array<uint8_t, 24> frame{};
+    frame[0] = 0xA8;
+    frame[1] = 1;
+    frame[2] = 9;
+    frame[3] = 1;
+    frame[4] = 0x13;
+    frame[5] = 0x20;
+    frame[6] = 3;
+    frame[7] = 6;
+    frame[8] = 10;
+    frame[10] = 9;
+    frame[12] = 8;
+    frame[14] = 12;
+    frame[16] = 0xF4;
+    frame[17] = 0xFF;
+    frame[18] = 40;
+    frame[20] = 180;
+    frame[21] = 190;
+    frame[22] = 1;
+    frame[23] = protocol::xorChecksum(frame.data(), frame.size() - 1);
+
+    protocol::DecodedPacket packet{};
+    protocol::DecodeError error = protocol::DecodeError::None;
+    assert(protocol::applicationPacketLength(0xA7) == 9);
+    assert(protocol::applicationPacketLength(0xA8) == 24);
+    assert(protocol::decodeApplicationFrame(
+        frame.data(), frame.size(), packet, error));
+    assert(packet.header == protocol::PacketHeader::MissionLinkFallbackTelemetry);
+    assert(packet.mission_link_fallback.schema_version == 1);
+    assert(packet.mission_link_fallback.primary_loss_reason == 1);
+    assert(packet.mission_link_fallback.east == 12);
+    assert(packet.mission_link_fallback.north == 0xFFF4);
+
+    frame[1] = 2;
+    frame[23] = protocol::xorChecksum(frame.data(), frame.size() - 1);
+    assert(!protocol::decodeApplicationFrame(
+        frame.data(), frame.size(), packet, error));
+    assert(error == protocol::DecodeError::InvalidField);
   }
 
   void testGoldenUplinks(const std::map<std::string, std::vector<uint8_t>> &vectors)
@@ -539,6 +708,8 @@ int main()
   const auto vectors = loadVectors();
   testGoldenPackets(vectors);
   testReservedModes(vectors);
+  testControlRollTelemetryV2();
+  testMissionLinkFallbackHeaderMigration();
   testGoldenUplinks(vectors);
   testMalformedFrames(vectors);
   testScalarSemantics(vectors);

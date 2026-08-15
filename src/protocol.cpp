@@ -155,6 +155,39 @@ namespace protocol
              read(reader, 16, value.elapsed) &&
              read(reader, 7, padding);
     }
+
+    bool decodeControlRollV2(BitReader &reader, ControlRollTelemetryV2 &value)
+    {
+      uint8_t header = 0;
+      return read(reader, 8, header) &&
+             read(reader, 8, value.schema_version) &&
+             read(reader, 16, value.control_roll_reference_unwrapped) &&
+             read(reader, 16, value.roll_deviation_unwrapped) &&
+             read(reader, 8, value.flags) &&
+             read(reader, 8, value.capture_event_sequence);
+    }
+
+    bool decodeMissionLinkFallback(
+        BitReader &reader, MissionLinkFallbackTelemetry &value)
+    {
+      uint8_t header = 0;
+      return read(reader, 8, header) &&
+             read(reader, 8, value.schema_version) &&
+             read(reader, 8, value.sequence) &&
+             read(reader, 8, value.primary_loss_reason) &&
+             read(reader, 16, value.status_flags) &&
+             read(reader, 8, value.last_valid_mission_state) &&
+             read(reader, 8, value.gnss_state) &&
+             read(reader, 16, value.mission_status_age) &&
+             read(reader, 16, value.any_mission_periodic_age) &&
+             read(reader, 16, value.power_time_age) &&
+             read(reader, 16, value.east) &&
+             read(reader, 16, value.north) &&
+             read(reader, 16, value.height) &&
+             read(reader, 8, value.logic_voltage) &&
+             read(reader, 8, value.motor_voltage) &&
+             read(reader, 8, value.can_health);
+    }
   } // 無名名前空間
 
   std::size_t applicationPacketLength(uint8_t header)
@@ -172,6 +205,10 @@ namespace protocol
     case PacketHeader::RecoveryBeacon:
       return 12;
     case PacketHeader::RecoveryLogData:
+      return 24;
+    case PacketHeader::ControlRollTelemetryV2:
+      return 9;
+    case PacketHeader::MissionLinkFallbackTelemetry:
       return 24;
     case PacketHeader::CommandResult:
       return 10;
@@ -276,6 +313,46 @@ namespace protocol
       }
       break;
     }
+    case PacketHeader::ControlRollTelemetryV2:
+    {
+      valid = decodeControlRollV2(reader, packet.control_roll_v2);
+      const ControlRollTelemetryV2 &value = packet.control_roll_v2;
+      const SemanticValue reference =
+          decodeControlRollV2(value.control_roll_reference_unwrapped);
+      const bool reference_out_of_range =
+          value.control_roll_reference_unwrapped == 0x800A;
+      const bool deviation_out_of_range =
+          value.roll_deviation_unwrapped == 0x800A;
+      if (valid &&
+          (value.schema_version != CONTROL_ROLL_TELEMETRY_V2_SCHEMA_VERSION ||
+           (value.flags & 0xE0U) != 0 ||
+           (((value.flags & 0x01U) != 0) != reference.numeric) ||
+           (((value.flags & 0x02U) != 0) && (value.flags & 0x01U) == 0) ||
+           (((value.flags & 0x08U) != 0) != reference_out_of_range) ||
+           (((value.flags & 0x10U) != 0) != deviation_out_of_range)))
+      {
+        decode_error = DecodeError::InvalidField;
+        return false;
+      }
+      break;
+    }
+    case PacketHeader::MissionLinkFallbackTelemetry:
+    {
+      valid = decodeMissionLinkFallback(reader, packet.mission_link_fallback);
+      const MissionLinkFallbackTelemetry &value = packet.mission_link_fallback;
+      if (valid &&
+          (value.schema_version != 1 || value.primary_loss_reason > 7 ||
+           (value.status_flags & 0x8000U) != 0 ||
+           (value.last_valid_mission_state > 4 &&
+            value.last_valid_mission_state != 0xFF) ||
+           value.gnss_state > 8 || value.height > 0x01FF ||
+           value.can_health > 6))
+      {
+        decode_error = DecodeError::InvalidField;
+        return false;
+      }
+      break;
+    }
     case PacketHeader::CommandResult:
     {
       uint8_t header = 0;
@@ -365,6 +442,17 @@ namespace protocol
         "ATTITUDE_ESTIMATOR_INVALID", "RESET_INVALIDATED", "INTERNAL_ERROR", "UNKNOWN"};
     return raw >= 0x8000 && raw <= 0x800F ? error(names[raw - 0x8000])
                                           : numeric(signExtend(raw, 16));
+  }
+
+  SemanticValue decodeControlRollV2(uint16_t raw)
+  {
+    if (raw == 0x800A)
+    {
+      // In this versioned packet the paired range flag disambiguates the
+      // legacy common code as an explicit OUT_OF_RANGE indication.
+      return error("OUT_OF_RANGE");
+    }
+    return decodeRoll(raw);
   }
 
   SemanticValue decodeRollRate(uint16_t raw)

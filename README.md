@@ -10,7 +10,9 @@ ESP32とE220を使用する99L地上局受信機です。対象branchは`vault`�
 - `src/main.cpp`: decode event処理、uplink送信task、console入力を担当します。UART TXは送信taskが所有し、transaction stateは送信taskの確保/解放と受信taskの終端result反映をmutexで直列化します。
 - E220 PHY設定、pin、LED、設定modeは従来構成を維持しています。
 
-受信packetはA0、A1〜A3、A4、A5、A6、B0、B1です。E220固定送信prefix `00 00 04`はGround側UARTへ届かない前提で、XOR対象に含めません。bit packingはLSB-firstです。
+受信packetはA0、A1〜A3、A4、A5、A6、A7 `ControlRollTelemetryV2`、A8 `MissionLinkFallbackTelemetry`、B0、B1です。Control roll contractはVault commit `f789fdef395c7b066d838a8f566ea4984231ab34`に固定しています。旧fallback用A7は受理せず、fallbackはA8/24 byteだけです。E220固定送信prefix `00 00 04`はGround側UARTへ届かない前提で、XOR対象に含めません。bit packingはLSB-firstです。
+
+A7はschema 2、signed16 little-endian 0.5 deg/LSBのunwrapped reference/deviation、flags、capture event sequence、XORからなる9 byte packetです。`+380 deg=760`、`+720 deg=1440`、`-720 deg=-1440`をそのままdecodeし、shortest-pathへ変換しません。`0x800A`と対応range flagは`OUT_OF_RANGE`として扱い、v1 flight rollをreference/deviationへ再解釈しません。
 
 ## Build / flash / run
 
@@ -90,7 +92,7 @@ sh test/run_host_tests.sh
 /home/hotaru/.platformio/penv/bin/pio run
 ```
 
-host testはMission/ComBoardとbyte-identicalな`testdata/99l_protocol_golden_vectors.txt`に加え、`testdata/99l_usb_v1_vectors.txt`を読みます。USB vectorはA0〜A6/B0/B1、invalid packet、RSSI欠落、4種fragment、TX/SYS、uint32 wrapを検証し、GroundFirmware側と同じSHA-256を使用します。
+host testはMission/ComBoardとbyte-identicalな`testdata/99l_protocol_golden_vectors.txt`に加え、`testdata/99l_usb_v1_vectors.txt`とGroundFirmware側とbyte-identicalな`testdata/99l_control_roll_v2_vectors.txt`を読みます。USB vectorはA0〜A6/B0/B1、invalid packet、RSSI欠落、4種fragment、TX/SYS、uint32 wrapを検証します。Control roll vectorはA7の+380/±720 deg、capture event、OUT_OF_RANGE、strict schema/flag validationを両repositoryで同じbyte列として検証します。
 
 ## Hardware validation (2026-08-14)
 

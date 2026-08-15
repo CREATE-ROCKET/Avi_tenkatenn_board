@@ -499,6 +499,8 @@ namespace
       updateStateLeds(packet.header);
       break;
     case protocol::PacketHeader::RecoveryLogData:
+    case protocol::PacketHeader::ControlRollTelemetryV2:
+    case protocol::PacketHeader::MissionLinkFallbackTelemetry:
       break;
     case protocol::PacketHeader::CommandResult:
     {
