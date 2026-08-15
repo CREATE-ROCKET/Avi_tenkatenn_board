@@ -350,6 +350,10 @@ namespace
 
   void testMissionLinkFallbackHeaderMigration()
   {
+    const auto vectors = loadVectors();
+    const auto shared = decode(vectors, "LORA_MISSION_LINK_FALLBACK");
+    assert(shared.header == protocol::PacketHeader::MissionLinkFallbackTelemetry);
+
     std::array<uint8_t, 24> frame{};
     frame[0] = 0xA8;
     frame[1] = 1;
