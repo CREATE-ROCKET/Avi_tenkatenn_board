@@ -12,7 +12,7 @@ namespace protocol
   constexpr std::size_t EMERGENCY_RESERVED_TRANSACTIONS = 2;
   constexpr uint8_t CONTROL_ROLL_TELEMETRY_V2_SCHEMA_VERSION = 2;
   constexpr char CONTROL_ROLL_TELEMETRY_V2_VAULT_SOURCE[] =
-      "f789fdef395c7b066d838a8f566ea4984231ab34";
+      "2a6fa974a9b7a50a9b9d574174262068e2e5b8bf";
 
   enum class PacketHeader : uint8_t
   {

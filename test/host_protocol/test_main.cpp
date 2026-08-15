@@ -269,9 +269,9 @@ namespace
   void testControlRollTelemetryV2()
   {
     assert(std::string(protocol::CONTROL_ROLL_TELEMETRY_V2_VAULT_SOURCE) ==
-           "f789fdef395c7b066d838a8f566ea4984231ab34");
+           "2a6fa974a9b7a50a9b9d574174262068e2e5b8bf");
     const auto vectors = loadControlRollVectors();
-    assert(vectors.size() == 8);
+    assert(vectors.size() == 9);
     for (const auto &entry : vectors)
     {
       const ControlRollVector &expected = entry.second;

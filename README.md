@@ -10,7 +10,7 @@ ESP32とE220を使用する99L地上局受信機です。対象branchは`vault`�
 - `src/main.cpp`: decode event処理、uplink送信task、console入力を担当します。UART TXは送信taskが所有し、transaction stateは送信taskの確保/解放と受信taskの終端result反映をmutexで直列化します。
 - E220 PHY設定、pin、LED、設定modeは従来構成を維持しています。
 
-受信packetはA0、A1〜A3、A4、A5、A6、A7 `ControlRollTelemetryV2`、A8 `MissionLinkFallbackTelemetry`、B0、B1です。Control roll contractはVault commit `f789fdef395c7b066d838a8f566ea4984231ab34`に固定しています。旧fallback用A7は受理せず、fallbackはA8/24 byteだけです。E220固定送信prefix `00 00 04`はGround側UARTへ届かない前提で、XOR対象に含めません。bit packingはLSB-firstです。
+受信packetはA0、A1〜A3、A4、A5、A6、A7 `ControlRollTelemetryV2`、A8 `MissionLinkFallbackTelemetry`、B0、B1です。Control roll contractはVault commit `2a6fa974a9b7a50a9b9d574174262068e2e5b8bf`に固定しています。旧fallback用A7は受理せず、fallbackはA8/24 byteだけです。E220固定送信prefix `00 00 04`はGround側UARTへ届かない前提で、XOR対象に含めません。bit packingはLSB-firstです。
 
 A7はschema 2、signed16 little-endian 0.5 deg/LSBのunwrapped reference/deviation、flags、capture event sequence、XORからなる9 byte packetです。`+380 deg=760`、`+720 deg=1440`、`-720 deg=-1440`をそのままdecodeし、shortest-pathへ変換しません。`0x800A`と対応range flagは`OUT_OF_RANGE`として扱い、v1 flight rollをreference/deviationへ再解釈しません。
 

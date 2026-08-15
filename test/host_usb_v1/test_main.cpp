@@ -163,7 +163,7 @@ namespace
   void testControlRollGoldenStream()
   {
     const auto vectors = loadControlRollRawVectors();
-    assert(vectors.size() == 8);
+    assert(vectors.size() == 9);
     uint32_t sequence = 100;
     for (const auto &entry : vectors)
     {
