@@ -4,7 +4,6 @@ path = Path("test/host_protocol/test_main.cpp")
 text = path.read_text(encoding="utf-8")
 old = """void testMissionLinkFallbackHeaderMigration() {
   USBV1Decoder decoder;
-
 """
 new = """void testMissionLinkFallbackHeaderMigration() {
   USBV1Decoder decoder;
@@ -17,7 +16,6 @@ new = """void testMissionLinkFallbackHeaderMigration() {
   const auto shared_decoded = decoder.decode(makeRxLine(shared_app, -84));
   assert(std::holds_alternative<usbv1::MissionLinkFallbackTelemetry>(
       shared_decoded.payload));
-
 """
 if text.count(old) != 1:
     raise SystemExit("shared fallback host-test anchor was not unique")
