@@ -102,6 +102,8 @@ namespace usb_v1
       return "TASK_INIT_FAILED";
     case SystemEvent::TransactionRelease:
       return "TRANSACTION_RELEASE";
+    case SystemEvent::UplinkAborted:
+      return "UPLINK_ABORTED";
     }
     return "TASK_INIT_FAILED";
   }
@@ -184,6 +186,10 @@ namespace usb_v1
       break;
     case SystemEvent::TransactionRelease:
       out.append(" id=%u ok=%u", record.id, record.ok ? 1U : 0U);
+      break;
+    case SystemEvent::UplinkAborted:
+      out.append(" kind=%u id=%u command=0x%02X error=%s",
+                 record.kind, record.id, record.command, record.error.data());
       break;
     case SystemEvent::Boot:
     case SystemEvent::Ready:

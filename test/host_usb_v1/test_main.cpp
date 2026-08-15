@@ -323,6 +323,17 @@ namespace
     assert(std::string(line.data(), length) ==
            "@SYS usb_v=1 board_ms=5010 event=TRANSACTION_RELEASE id=42 ok=1");
 
+    system = {};
+    system.board_ms = 5020;
+    system.event = usb_v1::SystemEvent::UplinkAborted;
+    system.kind = 0;
+    system.id = 43;
+    system.command = 0x13;
+    std::copy_n("BOUNDARY_TIMEOUT", 17, system.error.begin());
+    length = usb_v1::formatSystemLine(system, line.data(), line.size());
+    assert(std::string(line.data(), length) ==
+           vectors.at("SYS_UPLINK_ABORTED"));
+
     length = usb_v1::formatPrettyLine("commands:", line.data(), line.size());
     assert(std::string(line.data(), length) == "# commands:");
     assert(std::string(line.data(), length).find('\n') == std::string::npos);

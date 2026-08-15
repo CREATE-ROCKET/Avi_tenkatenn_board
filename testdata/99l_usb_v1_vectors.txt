@@ -19,6 +19,7 @@ TX_SUCCESS|LF|@TX usb_v=1 board_ms=6500 ok=1 kind=0 id=42 command=0x13 prefix=00
 TX_AUX_TIMEOUT|CRLF|@TX usb_v=1 board_ms=6600 ok=0 kind=0 id=42 command=0x13 prefix=000004 len=11 raw=55002A1385FF0000000016 error=AUX_TIMEOUT
 SYS_BOOT|CRLF|@SYS usb_v=1 board_ms=12 event=BOOT
 SYS_QUEUE_OVERFLOW|LF|@SYS usb_v=1 board_ms=3010 event=QUEUE_OVERFLOW source=USB_OUTPUT count=2
+SYS_UPLINK_ABORTED|LF|@SYS usb_v=1 board_ms=5020 event=UPLINK_ABORTED kind=0 id=43 command=0x13 error=BOUNDARY_TIMEOUT
 SYS_UNKNOWN_EXTRA|LF|@SYS usb_v=1 board_ms=3020 event=BOOT future=VALUE
 RX_WRAP_BEFORE|LF|@RX usb_v=1 seq=4294967295 board_ms=4294967290 dt_ms=NA rssi_present=1 rssi_raw=255 rssi_dbm=-1 valid=1 header=0xB1 len=3 error=NONE raw=B107B6
 RX_WRAP_AFTER|LF|@RX usb_v=1 seq=0 board_ms=5 dt_ms=11 rssi_present=1 rssi_raw=255 rssi_dbm=-1 valid=1 header=0xB1 len=3 error=NONE raw=B107B6

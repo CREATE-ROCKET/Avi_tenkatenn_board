@@ -39,6 +39,7 @@ namespace usb_v1
     QueueOverflow,
     TaskInitFailed,
     TransactionRelease,
+    UplinkAborted,
   };
 
   struct SystemRecord
@@ -47,6 +48,8 @@ namespace usb_v1
     SystemEvent event;
     uint32_t count;
     uint8_t id;
+    uint8_t kind;
+    uint8_t command;
     bool ok;
     std::array<char, 24> source;
     std::array<char, 24> task;

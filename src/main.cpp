@@ -702,15 +702,19 @@ namespace
       tx_record_emitted = true;
     };
     const auto fail_before_uplink = [&](const char *reason,
-                                        bool report_aux_timeout) {
+                                        const char *error_token) {
       if (reserved)
       {
         releaseTransaction(transaction_id);
       }
-      if (report_aux_timeout)
-      {
-        emit_tx(false, usb_v1::TxError::AuxTimeout, millis());
-      }
+      usb_v1::SystemRecord system{};
+      system.board_ms = millis();
+      system.event = usb_v1::SystemEvent::UplinkAborted;
+      system.kind = static_cast<uint8_t>(uplink.kind);
+      system.id = transaction_id;
+      system.command = uplink.command;
+      std::snprintf(system.error.data(), system.error.size(), "%s", error_token);
+      usb_v1::enqueueSystem(system);
       usb_v1::enqueuePrettyf("%s before uplink", reason);
       usb_v1::enqueuePrettyf("uplink failed id=%u", transaction_id);
     };
@@ -746,7 +750,7 @@ namespace
       {
         if (!waitAuxHigh(AUX_TIMEOUT_MS))
         {
-          fail_before_uplink("AUX timeout", true);
+          fail_before_uplink("AUX timeout", "AUX_TIMEOUT");
           return;
         }
         record_aux_ready();
@@ -763,7 +767,7 @@ namespace
                         static_cast<unsigned long>(message.requested_at_us),
                         static_cast<unsigned long>(message.dequeued_at_us));
 #endif
-          fail_before_uplink("AUX timeout", true);
+          fail_before_uplink("AUX timeout", "AUX_TIMEOUT");
           return;
         }
         if (aux_opportunity == TxOpportunity::EmergencyPending)
@@ -807,7 +811,8 @@ namespace
                         static_cast<unsigned long>(message.dequeued_at_us),
                         static_cast<unsigned long>(timing.boundary_wait_us));
 #endif
-          fail_before_uplink("downlink boundary timeout", false);
+          fail_before_uplink("downlink boundary timeout",
+                             "BOUNDARY_TIMEOUT");
           return;
         }
         // 2200 ms安全境界を得られない場合はavailabilityを優先して直接送る。
@@ -823,7 +828,7 @@ namespace
         // timeout確定後はboundaryを再待機せず、AUX Highだけを有限待機する。
         if (!waitAuxHigh(AUX_TIMEOUT_MS))
         {
-          fail_before_uplink("AUX timeout", true);
+          fail_before_uplink("AUX timeout", "AUX_TIMEOUT");
           return;
         }
         record_aux_ready();
