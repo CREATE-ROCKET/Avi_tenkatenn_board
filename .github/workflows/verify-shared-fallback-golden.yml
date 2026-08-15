@@ -16,15 +16,13 @@ jobs:
       - uses: actions/checkout@v4
       - name: Apply assertion
         run: python3 tools/apply_shared_fallback_golden.py
-      - name: Build host protocol tests
-        run: g++ -std=c++17 -Wall -Wextra -Wpedantic -Werror -Isrc test/host_protocol/test_main.cpp src/receiver_protocol.cpp src/recovery_relay.cpp -o /tmp/host_protocol_test
-      - name: Run host protocol tests
-        run: /tmp/host_protocol_test
+      - name: Run existing host tests
+        run: sh test/run_host_tests.sh
       - name: Commit verified change
         run: |
           git config user.name github-actions[bot]
           git config user.email 41898282+github-actions[bot]@users.noreply.github.com
-          git rm tools/apply_shared_fallback_golden.py .github/workflows/verify-shared-fallback-golden.yml
+          git rm -f tools/apply_shared_fallback_golden.py .github/workflows/verify-shared-fallback-golden.yml
           git add test/host_protocol/test_main.cpp
           git commit -m "test(ground): assert shared fallback golden"
           git push origin HEAD:test/shared-fallback-golden-20260816
