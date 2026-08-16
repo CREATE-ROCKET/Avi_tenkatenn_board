@@ -50,6 +50,9 @@ namespace protocol
     GroundTimeResponse = 4,
   };
 
+  // MissionGenericではAccepted + reason=NoneをGround GUIのACKとする。
+  // 3秒ACK timeoutはoperator-facing policyとしてGUIが所有し、このfirmwareは
+  // timeoutを理由にtransaction IDを自動解放・自動再送しない。
   enum class CommandPhase : uint8_t
   {
     Accepted = 0,
