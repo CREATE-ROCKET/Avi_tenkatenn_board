@@ -117,6 +117,8 @@ namespace protocol
     uint16_t east;
     uint16_t north;
     uint16_t height;
+    // 最新PreflightCalibration姿勢を0 degとする表示専用wrapped roll。
+    uint16_t display_roll;
   };
 
   struct DescentTelemetry
