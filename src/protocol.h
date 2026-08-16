@@ -14,6 +14,16 @@ namespace protocol
   constexpr char CONTROL_ROLL_TELEMETRY_V2_VAULT_SOURCE[] =
       "2a6fa974a9b7a50a9b9d574174262068e2e5b8bf";
 
+  // パラシュートの通常操作はOPEN/CLOSEの2種類だけを使用する。
+  // 0x20..0x24は旧absolute endpoint/Free/Hold/relative move用であり、新規送信に使用しない。
+  constexpr uint8_t PARACHUTE_OPEN_COMMAND = 0x25;
+  constexpr uint8_t PARACHUTE_CLOSE_COMMAND = 0x26;
+
+  constexpr bool isDeprecatedParachuteCommand(uint8_t command)
+  {
+    return command >= 0x20 && command <= 0x24;
+  }
+
   enum class PacketHeader : uint8_t
   {
     CommandReceive = 0xA0,
