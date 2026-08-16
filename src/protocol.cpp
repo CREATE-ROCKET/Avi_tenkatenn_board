@@ -108,24 +108,24 @@ namespace protocol
     bool decodeCommandReceive(BitReader &reader, CommandReceiveTelemetry &value)
     {
       uint8_t header = 0;
-      const bool valid = read(reader, 8, header) &&
-                         read(reader, 24, value.status) &&
-                         read(reader, 8, value.motor_profile) &&
-                         read(reader, 7, value.tilt_magnitude) &&
-                         read(reader, 9, value.tilt_direction) &&
-                         read(reader, 4, value.fin_mode) &&
-                         read(reader, 4, value.para_mode) &&
-                         read(reader, 8, value.fin_angle) &&
-                         read(reader, 8, value.para_angle) &&
-                         read(reader, 11, value.pressure) &&
-                         read(reader, 8, value.temperature) &&
-                         read(reader, 8, value.airspeed) &&
-                         read(reader, 8, value.logic_voltage) &&
-                         read(reader, 8, value.motor_voltage) &&
-                         read(reader, 16, value.east) &&
-                         read(reader, 16, value.north) &&
-                         read(reader, 9, value.height);
-      return valid;
+      return read(reader, 8, header) &&
+             read(reader, 24, value.status) &&
+             read(reader, 8, value.motor_profile) &&
+             read(reader, 7, value.tilt_magnitude) &&
+             read(reader, 9, value.tilt_direction) &&
+             read(reader, 4, value.fin_mode) &&
+             read(reader, 4, value.para_mode) &&
+             read(reader, 8, value.fin_angle) &&
+             read(reader, 8, value.para_angle) &&
+             read(reader, 11, value.pressure) &&
+             read(reader, 8, value.temperature) &&
+             read(reader, 8, value.airspeed) &&
+             read(reader, 8, value.logic_voltage) &&
+             read(reader, 8, value.motor_voltage) &&
+             read(reader, 16, value.east) &&
+             read(reader, 16, value.north) &&
+             read(reader, 9, value.height) &&
+             read(reader, 16, value.display_roll);
     }
 
     bool decodeDescent(BitReader &reader, DescentTelemetry &value, uint8_t &padding)
@@ -195,7 +195,7 @@ namespace protocol
     switch (static_cast<PacketHeader>(header))
     {
     case PacketHeader::CommandReceive:
-      return 22;
+      return 24;
     case PacketHeader::LiftoffDetection:
     case PacketHeader::EngineBurn:
     case PacketHeader::Control:
